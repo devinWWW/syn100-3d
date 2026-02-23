@@ -1,4 +1,7 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import * as THREE from "three";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import "./App.css";
 
 type Outcome = "HIGH" | "LOW";
 
@@ -8,13 +11,7 @@ type ChoiceInternal = {
   text: string;
 };
 
-type Turn = {
-  id: number;
-  alienLine: string;
-  choices: ChoiceInternal[];
-  nextHigh?: number;
-  nextLow?: number;
-};
+type StagePhase = "intro" | "questions" | "ending";
 
 type AnswerRecord = {
   turnId: number;
@@ -27,7 +24,82 @@ type AnswerRecord = {
   scoreAfter: number;
 };
 
-type StagePhase = "intro" | "questions";
+type ShipHumNodes = {
+  masterGain: GainNode;
+  oscillators: OscillatorNode[];
+};
+
+type SpeechVariant = {
+  rate: number;
+  pitch: number;
+  volumeScale: number;
+  openAiVoice?: string;
+  openAiStyle?: string;
+};
+
+type QuestionSpeechProfile = {
+  variants: SpeechVariant[];
+  openAiOnly: boolean;
+  overlayAlienOnOpenAi: boolean;
+  effectPreset: "none" | "whisper" | "layered" | "echo";
+};
+
+type QuestionSpeechSegment = {
+  text: string;
+  profile: QuestionSpeechProfile;
+};
+
+type PreparedSpeechLayer = {
+  url: string;
+  volumeScale: number;
+};
+
+type PreparedSpeechCacheEntry = {
+  layers: PreparedSpeechLayer[];
+};
+
+type ActiveSpeechLayer = {
+  audio: HTMLAudioElement;
+  volumeScale: number;
+};
+
+type FloatingWallSymbol = {
+  sprite: THREE.Sprite;
+  baseY: number;
+  angle: number;
+  radial: number;
+  driftSpeed: number;
+  phase: number;
+  twinkleSpeed: number;
+};
+
+type EndingCinematicStage =
+  | "inactive"
+  | "room-shake-flash"
+  | "fade-room-black"
+  | "show-saved"
+  | "show-destroyed-earth"
+  | "show-destroyed-engulf"
+  | "destroyed-fade-black"
+  | "complete";
+
+type EndingCinematicState = {
+  stage: EndingCinematicStage;
+  stageStartedAt: number;
+  blastStartedAt: number;
+  lastRumbleAt: number;
+};
+
+const SCORE_MIN = -10;
+const SCORE_MAX = 10;
+const TOTAL_TURNS = 10;
+const EARTH_SAVED_THRESHOLD = 2;
+const DARK_HORROR_AMBIENT_VOLUME_SCALE = 0.06;
+const OCEAN_AMBIENCE_VOLUME_SCALE = 0.72;
+const DISTANT_EXPLOSION_VOLUME_SCALE = 0.56;
+const ENDMUSIC_VOLUME_SCALE = 0.03;
+const BUILDUP_VOLUME_SCALE = 0.4;
+const BUILDUP_TRIM_OFFSET_SECONDS = 6;
 
 function shuffle<T>(arr: T[]) {
   const a = [...arr];
@@ -38,15 +110,351 @@ function shuffle<T>(arr: T[]) {
   return a;
 }
 
-const SCORE_MIN = -10;
-const SCORE_MAX = 10;
-const TOTAL_TURNS = 10;
-const EARTH_SAVED_THRESHOLD = 2;
-const INTRO_SCREEN_BG = "/intro_background.jpg";
-const GAMEPLAY_BG = "/game_background.jpg";
-const INTRO_SOUND = "/sfx_intro.wav";
-const ENDING_SAVED_SOUND = "/sfx_ending_saved.wav";
-const ENDING_DESTROYED_SOUND = "/sfx_ending_destroyed.wav";
+function collapseWhitespace(text: string) {
+  return text.replace(/\s*\n+\s*/g, " ").replace(/\s{2,}/g, " ").trim();
+}
+
+function normalizeAnswerText(text: string) {
+  return text.replace(/[“”"]/g, "").replace(/\s*\n+\s*/g, " ").replace(/\s{2,}/g, " ").trim();
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function getQuestionSpeechProfile(contextText: string): QuestionSpeechProfile {
+  const normalized = contextText.toLowerCase();
+  const hasWhisperCue = /whisper|hushed|murmur|quiet/i.test(normalized);
+  const hasLayeredCue = /many voices|multiple voices|layer|overlap|chorus/i.test(normalized);
+  const hasEchoBackCue = /duplicate|echo(es|ing)? back|read back/i.test(normalized);
+
+  const profile: QuestionSpeechProfile = {
+    variants: [{ rate: 0.78, pitch: 0.45, volumeScale: 0.88 }],
+    openAiOnly: false,
+    overlayAlienOnOpenAi: false,
+    effectPreset: "none",
+  };
+
+  if (hasWhisperCue && hasLayeredCue) {
+    profile.effectPreset = "layered";
+    profile.overlayAlienOnOpenAi = true;
+    profile.variants = [
+      {
+        rate: 0.58,
+        pitch: 0.16,
+        volumeScale: 0.46,
+        openAiVoice: "onyx",
+        openAiStyle: "Speak as a dark whispered alien voice. Keep it slow, breathy, and unsettling.",
+      },
+      {
+        rate: 0.94,
+        pitch: 0.9,
+        volumeScale: 0.24,
+        openAiVoice: "fable",
+        openAiStyle: "Speak softly as an eerie upper harmonic layer, like a ghostly overlapping voice.",
+      },
+      {
+        rate: 0.74,
+        pitch: 0.3,
+        volumeScale: 0.29,
+        openAiVoice: "echo",
+        openAiStyle: "Speak as a hollow ambient undertone. Quiet, distant, and ominous.",
+      },
+    ];
+    return profile;
+  }
+
+  if (hasLayeredCue) {
+    profile.effectPreset = "layered";
+    profile.overlayAlienOnOpenAi = true;
+    profile.variants = [
+      {
+        rate: 0.63,
+        pitch: 0.2,
+        volumeScale: 0.48,
+        openAiVoice: "onyx",
+        openAiStyle: "Speak with a cold, ominous robotic tone. Keep it steady and eerie.",
+      },
+      {
+        rate: 0.9,
+        pitch: 0.86,
+        volumeScale: 0.24,
+        openAiVoice: "fable",
+        openAiStyle: "Speak as a thin spectral overlay voice, synchronized with the primary line.",
+      },
+    ];
+    return profile;
+  }
+
+  if (hasWhisperCue) {
+    profile.effectPreset = "whisper";
+    profile.overlayAlienOnOpenAi = true;
+    profile.variants = [
+      {
+        rate: 0.61,
+        pitch: 0.14,
+        volumeScale: 0.45,
+        openAiVoice: "onyx",
+        openAiStyle: "Whisper this as a dark, close-mic alien murmur. Breath-heavy, unnerving, and low.",
+      },
+    ];
+    return profile;
+  }
+
+  if (hasEchoBackCue) {
+    profile.openAiOnly = true;
+    profile.effectPreset = "echo";
+    profile.variants = [
+      {
+        rate: 0.76,
+        pitch: 0.48,
+        volumeScale: 0.24,
+        openAiVoice: "echo",
+        openAiStyle: "Speak in a quiet synthetic tone, as if the listener's voice is being played back in a large metallic chamber.",
+      },
+    ];
+    return profile;
+  }
+
+  return profile;
+}
+
+function supportsOpenAiGeneration(segment: QuestionSpeechSegment) {
+  return segment.profile.variants.some((variant) => Boolean(variant.openAiVoice));
+}
+
+function getSpeechSegmentCacheKey(turnId: number, segmentIndex: number, segment: QuestionSpeechSegment) {
+  const variantKey = segment.profile.variants
+    .map((variant) => `${variant.openAiVoice ?? "none"}:${variant.openAiStyle ?? "none"}:${variant.volumeScale}`)
+    .join("|");
+  return `${turnId}-${segmentIndex}-${segment.text}-${variantKey}`;
+}
+
+function extractQuestionSpeechSegments(text: string): QuestionSpeechSegment[] {
+  const normalized = collapseWhitespace(text.replace(/^Alien Vessel:\s*/i, ""));
+  const quotesRegex = /["“]([^"”]+)["”]/g;
+
+  const segments: QuestionSpeechSegment[] = [];
+  let lastIndex = 0;
+
+  for (const match of normalized.matchAll(quotesRegex)) {
+    const quoteText = (match[1] ?? "").trim();
+    if (!quoteText) continue;
+
+    const quoteStart = match.index ?? 0;
+    const leadingContext = normalized.slice(lastIndex, quoteStart);
+    const baseProfile = getQuestionSpeechProfile(leadingContext);
+
+    const isFinalWhyPersist = /why\s+persist\??$/i.test(quoteText) && /repeatedly attempts communication/i.test(normalized);
+    const profile = isFinalWhyPersist
+      ? {
+          variants: [
+            {
+              rate: 0.5,
+              pitch: 0,
+              volumeScale: 0.74,
+              openAiVoice: "onyx",
+              openAiStyle: "Speak in an extremely deep, menacing, inhuman alien tone. Slow, ominous, and threatening.",
+            },
+            {
+              rate: 0.64,
+              pitch: 0.22,
+              volumeScale: 0.32,
+              openAiVoice: "echo",
+              openAiStyle: "Add a distant sinister undertone, like a shadow voice under the main line.",
+            },
+          ],
+          openAiOnly: false,
+          overlayAlienOnOpenAi: true,
+          effectPreset: "layered" as const,
+        }
+      : baseProfile;
+
+    segments.push({
+      text: quoteText,
+      profile,
+    });
+
+    lastIndex = quoteStart + match[0].length;
+  }
+
+  return segments;
+}
+
+function pickCreepyVoice(voices: SpeechSynthesisVoice[]) {
+  if (voices.length === 0) return null;
+
+  const voicePriority = [
+    /zira|hazel|hedda|susan|sara|mark|david|zira/i,
+    /microsoft|google|samantha|alex|victoria/i,
+    /en[-_](us|gb|ca|au)/i,
+    /en/i,
+  ];
+
+  for (const pattern of voicePriority) {
+    const matched = voices.find((voice) => pattern.test(`${voice.name} ${voice.lang}`));
+    if (matched) return matched;
+  }
+
+  return voices[0] ?? null;
+}
+
+function hasStructuredExplanationFormat(text: string) {
+  const normalized = text.trim();
+  const hasAllQuestions = Array.from({ length: TOTAL_TURNS }, (_, index) =>
+    new RegExp(`(^|\\n)Q${index + 1}:`, "i").test(normalized),
+  ).every(Boolean);
+  const hasOverall = /(^|\n)Overall:/i.test(normalized);
+  return hasAllQuestions && hasOverall;
+}
+
+function fallbackOutcomeExplanation(saved: boolean, score: number, history: AnswerRecord[]) {
+  const highCount = history.filter((h) => h.outcome === "HIGH").length;
+  const lowCount = history.length - highCount;
+
+  const perQuestion = Array.from({ length: TOTAL_TURNS }, (_, index) => {
+    const questionNumber = index + 1;
+    const picked = history.find((h) => h.turnId === questionNumber);
+
+    if (!picked) {
+      return `Q${questionNumber}: No recorded answer for this question, so no protocol impact was applied.`;
+    }
+
+    const choiceText = normalizeAnswerText(picked.chosenAnswerText);
+
+    if (picked.delta > 0) {
+      return `Q${questionNumber}: You chose "${choiceText}". This increased your score (+1) because it showed openness, adaptation, and willingness to interpret intelligence beyond human-centered assumptions.`;
+    }
+
+    return `Q${questionNumber}: You chose "${choiceText}". This reduced your score (-1) because it reflected a more human-centered framing and weaker cross-species perspective-taking.`;
+  }).join("\n\n");
+
+  const overall = saved
+    ? `Overall: Earth was spared because your final pattern included enough perspective-taking choices to reach ${score}, which is at or above the required threshold of ${EARTH_SAVED_THRESHOLD}. You selected ${highCount} favorable responses versus ${lowCount} unfavorable responses.`
+    : `Overall: Earth was destroyed because your final pattern stayed below the required threshold. You finished at ${score} (needs ${EARTH_SAVED_THRESHOLD} or higher), with ${highCount} favorable responses and ${lowCount} unfavorable responses.`;
+
+  return `${perQuestion}\n\n${overall}`;
+}
+
+async function generateOutcomeExplanation(saved: boolean, score: number, history: AnswerRecord[]) {
+  const apiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined;
+  const model = (import.meta.env.VITE_OPENAI_MODEL as string | undefined) ?? "gpt-4o-mini";
+
+  if (!apiKey) {
+    return fallbackOutcomeExplanation(saved, score, history);
+  }
+
+  const detailedQuestions = QUESTION_CONTENT.map((question, index) => {
+    const questionNumber = index + 1;
+    const picked = history.find((h) => h.turnId === questionNumber);
+
+    const options = question.choices
+      .map((choice, choiceIndex) => {
+        const optionLabel = String.fromCharCode(65 + choiceIndex);
+        const isPicked = picked && normalizeAnswerText(choice.text) === normalizeAnswerText(picked.chosenAnswerText);
+
+        return `  ${optionLabel}. ${normalizeAnswerText(choice.text)} | weight: ${choice.delta > 0 ? "+1" : "-1"}${isPicked ? " | PICKED" : ""}`;
+      })
+      .join("\n");
+
+    const pickedLine = picked
+      ? `Picked option summary: ${normalizeAnswerText(picked.chosenAnswerText)} | picked weight: ${picked.delta > 0 ? "+1" : "-1"}`
+      : "Picked option summary: (none recorded)";
+
+    return `Q${questionNumber}: ${collapseWhitespace(question.alienLine)}\n${options}\n${pickedLine}`;
+  }).join("\n\n");
+
+  const rubric = `Interpretation rules for this game:
+- +1 means the answer reduces human-centric bias, shows perspective-taking across species, and treats intelligence/communication as potentially non-human.
+- -1 means the answer imposes human bias or dominance assumptions on other species, reducing adaptive understanding.
+- Earth is spared when the overall pattern trends toward +1 logic strongly enough.
+- Earth explodes when the pattern trends toward -1 logic strongly enough.`;
+
+  const prompt = `You are writing the ending analysis for a story game in 6-9 concise sentences.
+Outcome: ${saved ? "Earth was spared" : "Earth exploded"}
+Final score: ${score}
+
+${rubric}
+
+Full question, option, and picked-answer data:
+${detailedQuestions}
+
+Task:
+1) Explain why this specific outcome happened using the full set of player choices.
+2) Explicitly connect chosen -1 answers to human bias/anthropocentric framing when relevant.
+3) Explicitly connect chosen +1 answers to perspective-taking and cross-species thinking when relevant.
+4) Keep it natural and readable for players.
+
+Output format rules (mandatory):
+- Return exactly 11 labeled sections in this order: Q1 through Q10, then Overall.
+- Use this label syntax exactly: "Q1:", "Q2:", ... "Q10:", and "Overall:".
+- Each Q section must be 1-2 sentences focused on that question's selected answer.
+- Overall must be 2-4 sentences summarizing why Earth was spared or destroyed.`;
+
+  async function requestCompletion(requestPrompt: string, temperature: number) {
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        model,
+        temperature,
+        messages: [{ role: "user", content: requestPrompt }],
+      }),
+    });
+
+    if (!response.ok) return null;
+
+    const data = await response.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (typeof content !== "string" || content.trim().length === 0) return null;
+    return content.trim();
+  }
+
+  try {
+    const firstPass = await requestCompletion(prompt, 0.4);
+    if (firstPass && hasStructuredExplanationFormat(firstPass)) {
+      return firstPass;
+    }
+
+    const repairPrompt = `Rewrite the following analysis to comply with the required output format exactly.
+
+Required labels and order:
+Q1:
+Q2:
+Q3:
+Q4:
+Q5:
+Q6:
+Q7:
+Q8:
+Q9:
+Q10:
+Overall:
+
+Rules:
+- Keep all reasoning grounded in the provided game data.
+- Keep each Q section to 1-2 sentences.
+- Keep Overall to 2-4 sentences.
+
+Game data:
+${detailedQuestions}
+
+Current analysis to rewrite:
+${firstPass ?? "(none)"}`;
+
+    const repaired = await requestCompletion(repairPrompt, 0.2);
+    if (repaired && hasStructuredExplanationFormat(repaired)) {
+      return repaired;
+    }
+
+    return fallbackOutcomeExplanation(saved, score, history);
+  } catch {
+    return fallbackOutcomeExplanation(saved, score, history);
+  }
+}
 
 const QUESTION_CONTENT: Array<{ alienLine: string; choices: ChoiceInternal[] }> = [
   {
@@ -311,285 +719,3269 @@ const QUESTION_CONTENT: Array<{ alienLine: string; choices: ChoiceInternal[] }> 
   },
 ];
 
-function getScoreAlienSrc(currentScore: number) {
-  if (currentScore >= -1 && currentScore <= 0) return "/neutral.png";
-  if (currentScore >= 1 && currentScore <= 3) return "/happy_1.png";
-  if (currentScore >= 4 && currentScore <= 6) return "/happy_2.png";
-  if (currentScore >= 7 && currentScore <= 10) return "/happy_3.png";
-  if (currentScore <= -2 && currentScore >= -4) return "/angry_1.png";
-  if (currentScore <= -5 && currentScore >= -7) return "/angry_2.png";
-  return "/angry_3.png";
-}
+const GEOMETRIC_SYMBOLS_TURN_INDEX = QUESTION_CONTENT.findIndex((question) =>
+  /geometric pulse pattern/i.test(question.alienLine),
+);
+const OCEAN_SOUNDS_TURN_INDEX = QUESTION_CONTENT.findIndex((question) => /ocean sounds/i.test(question.alienLine));
 
-function getQuestionEffectSrc(questionNumber: number) {
-  return `/effect_q${questionNumber}.png`;
-}
+function createSpaceshipInterior(): THREE.Group {
+  const ship = new THREE.Group();
 
-function getQuestionSoundSrc(questionNumber: number) {
-  return `/sfx_q${questionNumber}.wav`;
-}
+  const createMetalPanelTexture = (baseHex: string, lineHex: string) => {
+    const size = 512;
+    const canvas = document.createElement("canvas");
+    canvas.width = size;
+    canvas.height = size;
+    const context = canvas.getContext("2d");
 
-type QuestionSegment = { text: string; isSpeech: boolean };
-
-function collapseWhitespace(text: string) {
-  return text.replace(/\s*\n+\s*/g, " ").replace(/\s{2,}/g, " ").trim();
-}
-
-function parseQuestionSegments(text: string): QuestionSegment[] {
-  const cleaned = text.replace(/Alien Vessel:\s*/gi, "");
-  const segments: QuestionSegment[] = [];
-  const speechRegex = /[“"]([^”"]+)[”"]/g;
-
-  let lastIndex = 0;
-  let match = speechRegex.exec(cleaned);
-
-  while (match) {
-    const before = collapseWhitespace(cleaned.slice(lastIndex, match.index));
-    if (before) segments.push({ text: before, isSpeech: false });
-
-    const speech = collapseWhitespace(match[1]);
-    if (speech) segments.push({ text: speech, isSpeech: true });
-
-    lastIndex = speechRegex.lastIndex;
-    match = speechRegex.exec(cleaned);
-  }
-
-  const trailing = collapseWhitespace(cleaned.slice(lastIndex));
-  if (trailing) segments.push({ text: trailing, isSpeech: false });
-
-  return segments;
-}
-
-function normalizeAnswerText(text: string) {
-  return text
-    .replace(/[“”"]/g, "")
-    .replace(/\s*\n+\s*/g, " ")
-    .replace(/\s{2,}/g, " ")
-    .trim();
-}
-
-function fallbackOutcomeExplanation(
-  saved: boolean,
-  score: number,
-  history: AnswerRecord[]
-) {
-  const highCount = history.filter((h) => h.outcome === "HIGH").length;
-  const lowCount = history.length - highCount;
-
-  const perQuestion = Array.from({ length: TOTAL_TURNS }, (_, index) => {
-    const questionNumber = index + 1;
-    const picked = history.find((h) => h.turnId === questionNumber);
-
-    if (!picked) {
-      return `Q${questionNumber}: No recorded answer for this question, so no protocol impact was applied.`;
+    if (!context) {
+      return null;
     }
 
-    const choiceText = normalizeAnswerText(picked.chosenAnswerText);
+    context.fillStyle = baseHex;
+    context.fillRect(0, 0, size, size);
 
-    if (picked.delta > 0) {
-      return `Q${questionNumber}: You chose "${choiceText}". This increased your score (+1) because it showed openness, adaptation, and willingness to interpret intelligence beyond human-centered assumptions.`;
+    context.strokeStyle = lineHex;
+    context.lineWidth = 2;
+
+    const step = 64;
+    for (let x = 0; x <= size; x += step) {
+      context.beginPath();
+      context.moveTo(x, 0);
+      context.lineTo(x, size);
+      context.stroke();
     }
 
-    return `Q${questionNumber}: You chose "${choiceText}". This reduced your score (-1) because it reflected a more human-centered framing and weaker cross-species perspective-taking.`;
-  }).join("\n\n");
+    for (let y = 0; y <= size; y += step) {
+      context.beginPath();
+      context.moveTo(0, y);
+      context.lineTo(size, y);
+      context.stroke();
+    }
 
-  const overall = saved
-    ? `Overall: Earth was spared because your final pattern included enough perspective-taking choices to reach ${score}, which is at or above the required threshold of ${EARTH_SAVED_THRESHOLD}. You selected ${highCount} favorable responses versus ${lowCount} unfavorable responses.`
-    : `Overall: Earth was destroyed because your final pattern stayed below the required threshold. You finished at ${score} (needs ${EARTH_SAVED_THRESHOLD} or higher), with ${highCount} favorable responses and ${lowCount} unfavorable responses.`;
+    context.fillStyle = "rgba(255,255,255,0.22)";
+    for (let y = step; y < size; y += step) {
+      for (let x = step; x < size; x += step) {
+        context.beginPath();
+        context.arc(x - 8, y - 8, 2.2, 0, Math.PI * 2);
+        context.fill();
+      }
+    }
 
-  return `${perQuestion}\n\n${overall}`;
-}
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.RepeatWrapping;
+    texture.colorSpace = THREE.SRGBColorSpace;
+    return texture;
+  };
 
-function hasStructuredExplanationFormat(text: string) {
-  const normalized = text.trim();
-  const hasAllQuestions = Array.from({ length: TOTAL_TURNS }, (_, index) =>
-    new RegExp(`(^|\\n)Q${index + 1}:`, "i").test(normalized)
-  ).every(Boolean);
-  const hasOverall = /(^|\n)Overall:/i.test(normalized);
-  return hasAllQuestions && hasOverall;
-}
+  const wallPanelTexture = createMetalPanelTexture("#555b63", "#3d434c");
+  const floorPanelTexture = createMetalPanelTexture("#20242a", "#323741");
 
-async function generateOutcomeExplanation(
-  saved: boolean,
-  score: number,
-  history: AnswerRecord[]
-) {
-  const apiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined;
-  const model =
-    (import.meta.env.VITE_OPENAI_MODEL as string | undefined) ?? "gpt-4o-mini";
-
-  if (!apiKey) {
-    return fallbackOutcomeExplanation(saved, score, history);
+  if (wallPanelTexture) {
+    wallPanelTexture.repeat.set(6.5, 2.2);
   }
 
-  const detailedQuestions = QUESTION_CONTENT.map((question, index) => {
-    const questionNumber = index + 1;
-    const picked = history.find((h) => h.turnId === questionNumber);
+  if (floorPanelTexture) {
+    floorPanelTexture.repeat.set(8, 8);
+  }
 
-    const options = question.choices
-      .map((choice, choiceIndex) => {
-        const optionLabel = String.fromCharCode(65 + choiceIndex);
-        const isPicked =
-          picked &&
-          normalizeAnswerText(choice.text) === normalizeAnswerText(picked.chosenAnswerText);
+  const outerWall = new THREE.Mesh(
+    new THREE.CylinderGeometry(7.25, 7.25, 5.2, 64, 1, true),
+    new THREE.MeshStandardMaterial({
+      color: "#575d66",
+      map: wallPanelTexture ?? undefined,
+      roughness: 0.5,
+      metalness: 0.42,
+      side: THREE.BackSide,
+    }),
+  );
+  outerWall.position.y = 2.2;
+  ship.add(outerWall);
 
-        return `  ${optionLabel}. ${normalizeAnswerText(choice.text)} | weight: ${
-          choice.delta > 0 ? "+1" : "-1"
-        }${isPicked ? " | PICKED" : ""}`;
-      })
-      .join("\n");
+  const outerFloor = new THREE.Mesh(
+    new THREE.CircleGeometry(7.25, 64),
+    new THREE.MeshStandardMaterial({
+      color: "#24292f",
+      map: floorPanelTexture ?? undefined,
+      roughness: 0.42,
+      metalness: 0.64,
+    }),
+  );
+  outerFloor.rotation.x = -Math.PI / 2;
+  ship.add(outerFloor);
 
-    const pickedLine = picked
-      ? `Picked option summary: ${normalizeAnswerText(picked.chosenAnswerText)} | picked weight: ${
-          picked.delta > 0 ? "+1" : "-1"
-        }`
-      : "Picked option summary: (none recorded)";
+  const room = new THREE.Mesh(
+    new THREE.CylinderGeometry(6.4, 6.4, 4.8, 56, 1, true),
+    new THREE.MeshStandardMaterial({
+      color: "#343943",
+      map: wallPanelTexture ?? undefined,
+      roughness: 0.64,
+      metalness: 0.34,
+      side: THREE.BackSide,
+    }),
+  );
+  room.position.y = 1.95;
+  ship.add(room);
 
-    return `Q${questionNumber}: ${collapseWhitespace(question.alienLine)}\n${options}\n${pickedLine}`;
-  }).join("\n\n");
+  const floor = new THREE.Mesh(
+    new THREE.CircleGeometry(6.4, 56),
+    new THREE.MeshStandardMaterial({
+      color: "#20242c",
+      map: floorPanelTexture ?? undefined,
+      roughness: 0.5,
+      metalness: 0.5,
+    }),
+  );
+  floor.rotation.x = -Math.PI / 2;
+  ship.add(floor);
 
-  const rubric = `Interpretation rules for this game:
-- +1 means the answer reduces human-centric bias, shows perspective-taking across species, and treats intelligence/communication as potentially non-human.
-- -1 means the answer imposes human bias or dominance assumptions on other species, reducing adaptive understanding.
-- Earth is spared when the overall pattern trends toward +1 logic strongly enough.
-- Earth explodes when the pattern trends toward -1 logic strongly enough.`;
+  const ceiling = new THREE.Mesh(
+    new THREE.CircleGeometry(6.4, 56),
+    new THREE.MeshStandardMaterial({ color: "#3a404a", roughness: 0.62, metalness: 0.24 }),
+  );
+  ceiling.rotation.x = Math.PI / 2;
+  ceiling.position.y = 4.35;
+  ship.add(ceiling);
 
-  const prompt = `You are writing the ending analysis for a story game in 6-9 concise sentences.
-Outcome: ${saved ? "Earth was spared" : "Earth exploded"}
-Final score: ${score}
+  const ringMaterial = new THREE.MeshStandardMaterial({
+    color: "#1a2230",
+    emissive: "#000000",
+    emissiveIntensity: 0,
+    roughness: 0.74,
+    metalness: 0.36,
+  });
 
-${rubric}
+  for (let i = 0; i < 2; i++) {
+    const ring = new THREE.Mesh(new THREE.TorusGeometry(5.15 + i * 0.65, 0.08, 20, 80), ringMaterial);
+    ring.position.y = 1.92 + i * 0.92;
+    ring.rotation.x = Math.PI / 2;
+    ship.add(ring);
+  }
 
-Full question, option, and picked-answer data:
-${detailedQuestions}
+  const centerPlatform = new THREE.Mesh(
+    new THREE.CylinderGeometry(1.2, 1.45, 0.28, 48),
+    new THREE.MeshStandardMaterial({ color: "#121928", roughness: 0.88, metalness: 0.25 }),
+  );
+  centerPlatform.position.y = 0.14;
+  ship.add(centerPlatform);
 
-Task:
-1) Explain why this specific outcome happened using the full set of player choices.
-2) Explicitly connect chosen -1 answers to human bias/anthropocentric framing when relevant.
-3) Explicitly connect chosen +1 answers to perspective-taking and cross-species thinking when relevant.
-4) Keep it natural and readable for players.
+  const wireMaterial = new THREE.MeshStandardMaterial({
+    color: "#6a5418",
+    emissive: "#d2ad47",
+    emissiveIntensity: 0.95,
+    roughness: 0.32,
+    metalness: 0.16,
+    transparent: true,
+    opacity: 0.2,
+  });
 
-Output format rules (mandatory):
-- Return exactly 11 labeled sections in this order: Q1 through Q10, then Overall.
-- Use this label syntax exactly: "Q1:", "Q2:", ... "Q10:", and "Overall:".
-- Each Q section must be 1-2 sentences focused on that question's selected answer.
-- Overall must be 2-4 sentences summarizing why Earth was spared or destroyed.`;
+  const wallWireRadius = 6.22;
 
-  async function requestCompletion(requestPrompt: string, temperature: number) {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        model,
-        temperature,
-        messages: [{ role: "user", content: requestPrompt }],
-      }),
+  const wireRingTop = new THREE.Mesh(new THREE.TorusGeometry(wallWireRadius, 0.042, 12, 120), wireMaterial);
+  wireRingTop.position.y = 3.88;
+  wireRingTop.rotation.x = Math.PI / 2;
+  ship.add(wireRingTop);
+
+  const wireRingBottom = new THREE.Mesh(new THREE.TorusGeometry(wallWireRadius, 0.042, 12, 120), wireMaterial);
+  wireRingBottom.position.y = 0.52;
+  wireRingBottom.rotation.x = Math.PI / 2;
+  ship.add(wireRingBottom);
+
+  for (let i = 0; i < 18; i++) {
+    const angle = (i / 18) * Math.PI * 2;
+    const radial = wallWireRadius;
+    const x = Math.cos(angle) * radial;
+    const z = Math.sin(angle) * radial;
+
+    const midX = Math.cos(angle + 0.05) * (radial - 0.06);
+    const midZ = Math.sin(angle + 0.05) * (radial - 0.06);
+
+    const curve = new THREE.CatmullRomCurve3([
+      new THREE.Vector3(x, 3.88, z),
+      new THREE.Vector3(midX, 2.35, midZ),
+      new THREE.Vector3(x, 0.52, z),
+    ]);
+
+    const cable = new THREE.Mesh(new THREE.TubeGeometry(curve, 30, 0.024, 10, false), wireMaterial);
+    ship.add(cable);
+  }
+
+  return ship;
+}
+
+function createFloatingWallSymbols(): {
+  group: THREE.Group;
+  symbols: FloatingWallSymbol[];
+  textures: THREE.Texture[];
+} {
+  const group = new THREE.Group();
+  const symbols: FloatingWallSymbol[] = [];
+  const textures: THREE.Texture[] = [];
+
+  const glyphs = ["✦", "✧", "◌", "⌬", "⟁", "⟡", "⟢", "◇", "⊹", "⋆"];
+  const symbolCount = 84;
+  const wallRadius = 6.02;
+
+  for (let i = 0; i < symbolCount; i++) {
+    const glyph = glyphs[i % glyphs.length];
+    const canvas = document.createElement("canvas");
+    canvas.width = 128;
+    canvas.height = 128;
+    const context = canvas.getContext("2d");
+    if (!context) continue;
+
+    context.clearRect(0, 0, 128, 128);
+    context.fillStyle = "rgba(255,255,255,0.95)";
+    context.font = "700 84px Arial";
+    context.textAlign = "center";
+    context.textBaseline = "middle";
+    context.shadowColor = "rgba(255,255,255,0.85)";
+    context.shadowBlur = 12;
+    context.fillText(glyph, 64, 66);
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.colorSpace = THREE.SRGBColorSpace;
+    texture.needsUpdate = true;
+    textures.push(texture);
+
+    const material = new THREE.SpriteMaterial({
+      map: texture,
+      color: "#ffffff",
+      transparent: true,
+      opacity: 0.2 + Math.random() * 0.25,
+      depthWrite: false,
+      blending: THREE.AdditiveBlending,
     });
 
-    if (!response.ok) return null;
+    const sprite = new THREE.Sprite(material);
+    const angle = (i / symbolCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.24;
+    const radial = wallRadius + (Math.random() - 0.5) * 0.07;
+    const baseY = 0.62 + Math.random() * 3.48;
+    const scale = 0.28 + Math.random() * 0.3;
 
-    const data = await response.json();
-    const content = data?.choices?.[0]?.message?.content;
-    if (typeof content !== "string" || content.trim().length === 0) return null;
-    return content.trim();
+    sprite.scale.set(scale, scale, 1);
+    sprite.position.set(Math.cos(angle) * radial, baseY, Math.sin(angle) * radial);
+    group.add(sprite);
+
+    symbols.push({
+      sprite,
+      baseY,
+      angle,
+      radial,
+      driftSpeed: 0.22 + Math.random() * 0.38,
+      phase: Math.random() * Math.PI * 2,
+      twinkleSpeed: 0.65 + Math.random() * 1.25,
+    });
   }
 
-  try {
-    const firstPass = await requestCompletion(prompt, 0.4);
-    if (firstPass && hasStructuredExplanationFormat(firstPass)) {
-      return firstPass;
+  return { group, symbols, textures };
+}
+
+function enableProceduralLimbMotion(
+  root: THREE.Object3D,
+  timeUniforms: Array<{ value: number }>,
+  headNoUniforms: Array<{ value: number }>,
+  headYesUniforms: Array<{ value: number }>,
+  armTalkUniforms: Array<{ value: number }>,
+  headTalkUniforms: Array<{ value: number }>,
+) {
+  root.traverse((object) => {
+    const mesh = object as THREE.Mesh;
+    if (!mesh.isMesh || !mesh.geometry) {
+      return;
     }
 
-    const repairPrompt = `Rewrite the following analysis to comply with the required output format exactly.
-
-Required labels and order:
-Q1:
-Q2:
-Q3:
-Q4:
-Q5:
-Q6:
-Q7:
-Q8:
-Q9:
-Q10:
-Overall:
-
-Rules:
-- Keep all reasoning grounded in the provided game data.
-- Keep each Q section to 1-2 sentences.
-- Keep Overall to 2-4 sentences.
-
-Game data:
-${detailedQuestions}
-
-Current analysis to rewrite:
-${firstPass ?? "(none)"}`;
-
-    const repaired = await requestCompletion(repairPrompt, 0.2);
-    if (repaired && hasStructuredExplanationFormat(repaired)) {
-      return repaired;
+    mesh.geometry.computeBoundingBox();
+    const geometryBounds = mesh.geometry.boundingBox;
+    if (!geometryBounds) {
+      return;
     }
 
-    return fallbackOutcomeExplanation(saved, score, history);
-  } catch {
-    return fallbackOutcomeExplanation(saved, score, history);
-  }
+    const size = new THREE.Vector3();
+    geometryBounds.getSize(size);
+
+    const minY = geometryBounds.min.y;
+    const height = Math.max(size.y, 0.001);
+    const halfWidth = Math.max(size.x * 0.5, 0.001);
+
+    const sourceMaterials = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+    const animatedMaterials = sourceMaterials.map((material) => {
+      const stdMat = material as THREE.MeshStandardMaterial;
+      const clonedMaterial = stdMat.clone();
+      const uLimbTime = { value: 0 };
+      const uHeadNo = { value: 0 };
+      const uHeadYes = { value: 0 };
+      const uArmTalk = { value: 0 };
+      const uHeadTalk = { value: 0 };
+      timeUniforms.push(uLimbTime);
+      headNoUniforms.push(uHeadNo);
+      headYesUniforms.push(uHeadYes);
+      armTalkUniforms.push(uArmTalk);
+      headTalkUniforms.push(uHeadTalk);
+
+      clonedMaterial.onBeforeCompile = (shader) => {
+        shader.uniforms.uLimbTime = uLimbTime;
+        shader.uniforms.uHeadNo = uHeadNo;
+        shader.uniforms.uHeadYes = uHeadYes;
+        shader.uniforms.uArmTalk = uArmTalk;
+        shader.uniforms.uHeadTalk = uHeadTalk;
+        shader.uniforms.uMinY = { value: minY };
+        shader.uniforms.uHeight = { value: height };
+        shader.uniforms.uHalfWidth = { value: halfWidth };
+
+        shader.vertexShader = shader.vertexShader
+          .replace(
+            "#include <common>",
+            `#include <common>
+uniform float uLimbTime;
+uniform float uHeadNo;
+uniform float uHeadYes;
+uniform float uArmTalk;
+uniform float uHeadTalk;
+uniform float uMinY;
+uniform float uHeight;
+uniform float uHalfWidth;`,
+          )
+          .replace(
+            "#include <beginnormal_vertex>",
+            `vec3 objectNormal = vec3( normal );
+#ifdef USE_TANGENT
+  vec3 objectTangent = vec3( tangent.xyz );
+#endif
+
+float nYNorm = clamp((position.y - uMinY) / uHeight, 0.0, 1.0);
+float nXNorm = clamp((position.x + uHalfWidth) / (uHalfWidth * 2.0), 0.0, 1.0);
+
+float nTopMask = pow(smoothstep(0.73, 0.84, nYNorm), 3.2);
+float nNoAngle = uHeadNo;
+float nNoCos = cos(nNoAngle);
+float nNoSin = sin(nNoAngle);
+vec2 nTopNoLocal = vec2(objectNormal.x, objectNormal.z);
+vec2 nTopNoRotated = vec2(
+  nTopNoLocal.x * nNoCos - nTopNoLocal.y * nNoSin,
+  nTopNoLocal.x * nNoSin + nTopNoLocal.y * nNoCos
+);
+objectNormal.x = mix(objectNormal.x, nTopNoRotated.x, nTopMask);
+objectNormal.z = mix(objectNormal.z, nTopNoRotated.y, nTopMask);
+
+float nYesAngle = uHeadYes;
+float nYesCos = cos(nYesAngle);
+float nYesSin = sin(nYesAngle);
+vec2 nTopYesLocal = vec2(objectNormal.y, objectNormal.z);
+vec2 nTopYesRotated = vec2(
+  nTopYesLocal.x * nYesCos - nTopYesLocal.y * nYesSin,
+  nTopYesLocal.x * nYesSin + nTopYesLocal.y * nYesCos
+);
+objectNormal.y = mix(objectNormal.y, nTopYesRotated.x, nTopMask);
+objectNormal.z = mix(objectNormal.z, nTopYesRotated.y, nTopMask);
+
+float nHeadTalkStrengthRaw = clamp(uHeadTalk, 0.0, 1.0);
+float nHeadTalkStrength = nHeadTalkStrengthRaw * nHeadTalkStrengthRaw * (3.0 - 2.0 * nHeadTalkStrengthRaw);
+float nNodPrimary = sin(uLimbTime * 7.6 + sin(uLimbTime * 1.7) * 0.9);
+float nNodSecondary = sin(uLimbTime * 12.9 + 0.8);
+float nNodAngle = (nNodPrimary * 0.045 + nNodSecondary * 0.018) * nHeadTalkStrength;
+float nNodCos = cos(nNodAngle);
+float nNodSin = sin(nNodAngle);
+vec2 nTopNodLocal = vec2(objectNormal.y, objectNormal.z);
+vec2 nTopNodRotated = vec2(
+  nTopNodLocal.x * nNodCos - nTopNodLocal.y * nNodSin,
+  nTopNodLocal.x * nNodSin + nTopNodLocal.y * nNodCos
+);
+objectNormal.y = mix(objectNormal.y, nTopNodRotated.x, nTopMask);
+objectNormal.z = mix(objectNormal.z, nTopNodRotated.y, nTopMask);
+
+float nLeftHandMaskX = step(0.00, nXNorm) * (1.0 - step(0.27, nXNorm));
+float nLeftHandMaskY = step(0.12, nYNorm) * (1.0 - step(0.56, nYNorm));
+float nLeftDebugArmMask = nLeftHandMaskX * nLeftHandMaskY;
+float nRightHandMaskX = step(0.728, nXNorm) * (1.0 - step(1.01, nXNorm));
+float nRightDebugArmMask = nRightHandMaskX * nLeftHandMaskY;
+
+float nTalkStrengthRaw = clamp(uArmTalk, 0.0, 1.0);
+float nTalkStrength = nTalkStrengthRaw * nTalkStrengthRaw * (3.0 - 2.0 * nTalkStrengthRaw);
+float nTalkBob = sin(uLimbTime * 2.4) * 0.14;
+float nArmForwardAngle = -nTalkStrength * (1.6580628 + nTalkBob);
+float nArmCos = cos(nArmForwardAngle);
+float nArmSin = sin(nArmForwardAngle);
+
+vec2 nLeftArmYZ = vec2(objectNormal.y, objectNormal.z);
+vec2 nLeftArmYZRotated = vec2(
+  nLeftArmYZ.x * nArmCos - nLeftArmYZ.y * nArmSin,
+  nLeftArmYZ.x * nArmSin + nLeftArmYZ.y * nArmCos
+);
+objectNormal.y = mix(objectNormal.y, nLeftArmYZRotated.x, nLeftDebugArmMask);
+objectNormal.z = mix(objectNormal.z, nLeftArmYZRotated.y, nLeftDebugArmMask);
+
+vec2 nRightArmYZ = vec2(objectNormal.y, objectNormal.z);
+vec2 nRightArmYZRotated = vec2(
+  nRightArmYZ.x * nArmCos - nRightArmYZ.y * nArmSin,
+  nRightArmYZ.x * nArmSin + nRightArmYZ.y * nArmCos
+);
+objectNormal.y = mix(objectNormal.y, nRightArmYZRotated.x, nRightDebugArmMask);
+objectNormal.z = mix(objectNormal.z, nRightArmYZRotated.y, nRightDebugArmMask);`,
+          )
+          .replace(
+            "#include <begin_vertex>",
+            `vec3 transformed = vec3(position);
+float yNorm = clamp((position.y - uMinY) / uHeight, 0.0, 1.0);
+float xNorm = clamp((position.x + uHalfWidth) / (uHalfWidth * 2.0), 0.0, 1.0);
+
+float bodyMask = smoothstep(0.08, 0.72, yNorm) * (1.0 - smoothstep(0.74, 0.87, yNorm));
+float breathing = sin(uLimbTime * 1.785 + 1.2);
+float breathingLift = sin(uLimbTime * 1.785 + 0.25);
+
+transformed.z += bodyMask * breathing * (uHeight * 0.018);
+transformed.y += bodyMask * breathingLift * (uHeight * 0.0075);
+
+float topMask = pow(smoothstep(0.73, 0.84, yNorm), 3.2);
+float noAngle = uHeadNo;
+float pivotY = uMinY + uHeight * 0.75;
+
+float noCos = cos(noAngle);
+float noSin = sin(noAngle);
+vec2 topNoLocal = vec2(transformed.x, transformed.z);
+vec2 topNoRotated = vec2(
+  topNoLocal.x * noCos - topNoLocal.y * noSin,
+  topNoLocal.x * noSin + topNoLocal.y * noCos
+);
+
+transformed.x = mix(transformed.x, topNoRotated.x, topMask);
+transformed.z = mix(transformed.z, topNoRotated.y, topMask);
+
+float yesAngle = uHeadYes;
+float yesCos = cos(yesAngle);
+float yesSin = sin(yesAngle);
+vec2 topYesLocal = vec2(transformed.y - pivotY, transformed.z);
+vec2 topYesRotated = vec2(
+  topYesLocal.x * yesCos - topYesLocal.y * yesSin,
+  topYesLocal.x * yesSin + topYesLocal.y * yesCos
+);
+
+transformed.y = mix(transformed.y, topYesRotated.x + pivotY, topMask);
+transformed.z = mix(transformed.z, topYesRotated.y, topMask);
+
+float headTalkStrengthRaw = clamp(uHeadTalk, 0.0, 1.0);
+float headTalkStrength = headTalkStrengthRaw * headTalkStrengthRaw * (3.0 - 2.0 * headTalkStrengthRaw);
+float nodPrimary = sin(uLimbTime * 7.6 + sin(uLimbTime * 1.7) * 0.9);
+float nodSecondary = sin(uLimbTime * 12.9 + 0.8);
+float nodAngle = (nodPrimary * 0.045 + nodSecondary * 0.018) * headTalkStrength;
+float nodCos = cos(nodAngle);
+float nodSin = sin(nodAngle);
+
+vec2 topNodLocal = vec2(transformed.y - pivotY, transformed.z);
+vec2 topNodRotated = vec2(
+  topNodLocal.x * nodCos - topNodLocal.y * nodSin,
+  topNodLocal.x * nodSin + topNodLocal.y * nodCos
+);
+
+transformed.y = mix(transformed.y, topNodRotated.x + pivotY, topMask);
+transformed.z = mix(transformed.z, topNodRotated.y, topMask);`,
+          );
+
+        shader.vertexShader = shader.vertexShader.replace(
+          "#include <project_vertex>",
+          `
+float leftHandMaskX = step(0.00, xNorm) * (1.0 - step(0.27, xNorm));
+float leftHandMaskY = step(0.12, yNorm) * (1.0 - step(0.56, yNorm));
+float leftDebugArmMask = leftHandMaskX * leftHandMaskY;
+float rightHandMaskX = step(0.728, xNorm) * (1.0 - step(1.01, xNorm));
+float rightHandMaskY = leftHandMaskY;
+float rightDebugArmMask = rightHandMaskX * rightHandMaskY;
+
+float talkStrengthRaw = clamp(uArmTalk, 0.0, 1.0);
+float talkStrength = talkStrengthRaw * talkStrengthRaw * (3.0 - 2.0 * talkStrengthRaw);
+float talkBob = sin(uLimbTime * 2.4) * 0.14;
+float armForwardAngle = -talkStrength * (1.6580628 + talkBob);
+
+float armCos = cos(armForwardAngle);
+float armSin = sin(armForwardAngle);
+float armPivotY = uMinY + uHeight * 0.54;
+
+vec2 leftArmYZ = vec2(transformed.y - armPivotY, transformed.z);
+vec2 leftArmYZRotated = vec2(
+  leftArmYZ.x * armCos - leftArmYZ.y * armSin,
+  leftArmYZ.x * armSin + leftArmYZ.y * armCos
+);
+
+transformed.y = mix(transformed.y, leftArmYZRotated.x + armPivotY, leftDebugArmMask);
+transformed.z = mix(transformed.z, leftArmYZRotated.y, leftDebugArmMask);
+
+vec2 rightArmYZ = vec2(transformed.y - armPivotY, transformed.z);
+vec2 rightArmYZRotated = vec2(
+  rightArmYZ.x * armCos - rightArmYZ.y * armSin,
+  rightArmYZ.x * armSin + rightArmYZ.y * armCos
+);
+
+transformed.y = mix(transformed.y, rightArmYZRotated.x + armPivotY, rightDebugArmMask);
+transformed.z = mix(transformed.z, rightArmYZRotated.y, rightDebugArmMask);
+
+#include <project_vertex>
+`,
+        );
+      };
+
+      clonedMaterial.needsUpdate = true;
+      return clonedMaterial;
+    });
+
+    mesh.material = Array.isArray(mesh.material) ? animatedMaterials : animatedMaterials[0];
+  });
 }
 
 export default function App() {
-  const turns: Turn[] = useMemo(() => {
-    return QUESTION_CONTENT.map((content, i) => {
-      const id = i + 1;
-      const next = id < TOTAL_TURNS ? id + 1 : undefined;
-      return {
-        id,
-        alienLine: content.alienLine,
-        choices: content.choices,
-        nextHigh: next,
-        nextLow: next,
-      };
-    });
-  }, []);
-
-  const turnById = useMemo(() => {
-    const map = new Map<number, Turn>();
-    for (const turn of turns) map.set(turn.id, turn);
-    return map;
-  }, [turns]);
-
+  const mountRef = useRef<HTMLDivElement | null>(null);
   const [phase, setPhase] = useState<StagePhase>("intro");
-  const [turnId, setTurnId] = useState<number>(1);
-  const [score, setScore] = useState<number>(0);
+  const [turnIndex, setTurnIndex] = useState(0);
+  const [score, setScore] = useState(0);
   const [history, setHistory] = useState<AnswerRecord[]>([]);
-  const [endingExplanation, setEndingExplanation] = useState<string>("");
-  const lastPlayedSoundKeyRef = useRef<string>("");
+  const [endingExplanation, setEndingExplanation] = useState("");
+  const [revealProgress, setRevealProgress] = useState(0);
+  const [isRevealing, setIsRevealing] = useState(false);
+  const [typedAlienText, setTypedAlienText] = useState("");
+  const [answersVisible, setAnswersVisible] = useState(false);
+  const [endingBlackoutOpacity, setEndingBlackoutOpacity] = useState(0);
+  const [endingFlashOpacity, setEndingFlashOpacity] = useState(0);
+  const [endingPanelVisible, setEndingPanelVisible] = useState(false);
+  const [masterVolume, setMasterVolume] = useState(50);
+  const isDevBuild = import.meta.env.DEV;
+  const voiceEnabled = true;
+  const humAudioContextRef = useRef<AudioContext | null>(null);
+  const humNodesRef = useRef<ShipHumNodes | null>(null);
+  const humOutputGainRef = useRef<GainNode | null>(null);
+  const turbulenceTimerRef = useRef<number | null>(null);
+  const buttonClickAudioRef = useRef<HTMLAudioElement | null>(null);
+  const revealAudioRef = useRef<HTMLAudioElement | null>(null);
+  const revealAudioStartedRef = useRef(false);
+  const darkHorrorAmbientAudioRef = useRef<HTMLAudioElement | null>(null);
+  const darkHorrorAmbientGainRef = useRef(0);
+  const darkHorrorAmbientFadeFrameRef = useRef<number | null>(null);
+  const oceanAmbienceAudioRef = useRef<HTMLAudioElement | null>(null);
+  const oceanAmbienceGainRef = useRef(0);
+  const oceanAmbienceFadeFrameRef = useRef<number | null>(null);
+  const distantExplosionAudioRef = useRef<HTMLAudioElement | null>(null);
+  const endMusicAudioRef = useRef<HTMLAudioElement | null>(null);
+  const endMusicGainRef = useRef(0);
+  const endMusicFadeFrameRef = useRef<number | null>(null);
+  const buildupAudioRef = useRef<HTMLAudioElement | null>(null);
+  const buildupGainRef = useRef(0);
+  const buildupFadeFrameRef = useRef<number | null>(null);
+  const endingBlackoutOpacityRef = useRef(0);
+  const endingFlashOpacityRef = useRef(0);
+  const endingPanelVisibleRef = useRef(false);
+  const endingSavedOutcomeRef = useRef(false);
+  const endingCinematicRef = useRef<EndingCinematicState>({
+    stage: "inactive",
+    stageStartedAt: 0,
+    blastStartedAt: 0,
+    lastRumbleAt: 0,
+  });
+  const masterVolumeRef = useRef(0.5);
+  const revealProgressRef = useRef(0);
+  const isRevealingRef = useRef(false);
+  const phaseRef = useRef<StagePhase>("intro");
+  const turnIndexRef = useRef(0);
+  const typedQuestionCharsRef = useRef(0);
+  const currentQuestionCharsRef = useRef(0);
+  const spokenTurnRef = useRef<number | null>(null);
+  const speechVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
+  const speechDelayTimeoutRef = useRef<number | null>(null);
+  const speechQueueTokenRef = useRef(0);
+  const speechAudioLayersRef = useRef<ActiveSpeechLayer[]>([]);
+  const speechAbortControllersRef = useRef<AbortController[]>([]);
+  const preparedSpeechCacheRef = useRef<Map<string, PreparedSpeechCacheEntry>>(new Map());
+  const preparedSpeechPromisesRef = useRef<Map<string, Promise<PreparedSpeechCacheEntry | null>>>(new Map());
+  const speechFxContextRef = useRef<AudioContext | null>(null);
+  const stunStartedAtRef = useRef(0);
+  const stunEndsAtRef = useRef(0);
+  const stunIntensityRef = useRef(1);
+  const headReactionStartedAtRef = useRef(0);
+  const headJoltEndsAtRef = useRef(0);
+  const headJoltDirectionRef = useRef(1);
+  const headReactionModeRef = useRef<"none" | "no" | "yes">("none");
 
-  const currentTurn = turnById.get(turnId);
-  const isGameOver = phase === "questions" && !currentTurn;
+  const openAiApiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined;
+  const openAiTtsModel = (import.meta.env.VITE_OPENAI_TTS_MODEL as string | undefined) ?? "gpt-4o-mini-tts";
 
+  const speechSupported = typeof window !== "undefined" && typeof window.speechSynthesis !== "undefined";
+
+  const currentTurn = phase === "questions" ? QUESTION_CONTENT[turnIndex] : null;
   const displayChoices = useMemo(() => {
     if (phase !== "questions" || !currentTurn) return [] as ChoiceInternal[];
     return shuffle(currentTurn.choices);
   }, [phase, currentTurn]);
 
+  useEffect(() => {
+    if (phase !== "ending") {
+      return;
+    }
+
+    let isCancelled = false;
+
+    generateOutcomeExplanation(score >= EARTH_SAVED_THRESHOLD, score, history).then((text) => {
+      if (isCancelled) return;
+      setEndingExplanation(text);
+    });
+
+    return () => {
+      isCancelled = true;
+    };
+  }, [phase, score, history]);
+
+  const stopShipHum = useCallback(async () => {
+    if (turbulenceTimerRef.current !== null) {
+      window.clearTimeout(turbulenceTimerRef.current);
+      turbulenceTimerRef.current = null;
+    }
+
+    const context = humAudioContextRef.current;
+    const nodes = humNodesRef.current;
+
+    if (nodes && context && context.state !== "closed") {
+      const now = context.currentTime;
+      nodes.masterGain.gain.cancelScheduledValues(now);
+      nodes.masterGain.gain.setValueAtTime(Math.max(nodes.masterGain.gain.value, 0.0001), now);
+      nodes.masterGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+
+      for (const osc of nodes.oscillators) {
+        osc.stop(now + 0.22);
+      }
+    }
+
+    humNodesRef.current = null;
+
+    if (context && context.state !== "closed") {
+      await context.close();
+    }
+    humAudioContextRef.current = null;
+    humOutputGainRef.current = null;
+  }, []);
+
+  const stopQuestionSpeech = useCallback(() => {
+    speechQueueTokenRef.current += 1;
+
+    if (speechDelayTimeoutRef.current !== null) {
+      window.clearTimeout(speechDelayTimeoutRef.current);
+      speechDelayTimeoutRef.current = null;
+    }
+
+    for (const controller of speechAbortControllersRef.current) {
+      controller.abort();
+    }
+    speechAbortControllersRef.current = [];
+
+    for (const layer of speechAudioLayersRef.current) {
+      layer.audio.pause();
+      layer.audio.currentTime = 0;
+      layer.audio.src = "";
+    }
+    speechAudioLayersRef.current = [];
+
+    if (!speechSupported) return;
+    window.speechSynthesis.cancel();
+  }, [speechSupported]);
+
+  const clearPreparedSpeechCache = useCallback(() => {
+    for (const entry of preparedSpeechCacheRef.current.values()) {
+      for (const layer of entry.layers) {
+        URL.revokeObjectURL(layer.url);
+      }
+    }
+
+    preparedSpeechCacheRef.current.clear();
+    preparedSpeechPromisesRef.current.clear();
+  }, []);
+
+  const prepareOpenAiLayeredSpeech = useCallback(
+    async (segment: QuestionSpeechSegment, cacheKey: string) => {
+      if (!openAiApiKey || !supportsOpenAiGeneration(segment)) {
+        return null;
+      }
+
+      const cached = preparedSpeechCacheRef.current.get(cacheKey);
+      if (cached) {
+        return cached;
+      }
+
+      const inFlight = preparedSpeechPromisesRef.current.get(cacheKey);
+      if (inFlight) {
+        return inFlight;
+      }
+
+      const promise = (async () => {
+        const controller = new AbortController();
+        speechAbortControllersRef.current.push(controller);
+
+        try {
+          const layeredVariants = segment.profile.variants.filter((variant) => Boolean(variant.openAiVoice));
+
+          const layers = await Promise.all(
+            layeredVariants.map(async (variant) => {
+              const response = await fetch("https://api.openai.com/v1/audio/speech", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  Authorization: `Bearer ${openAiApiKey}`,
+                },
+                body: JSON.stringify({
+                  model: openAiTtsModel,
+                  voice: variant.openAiVoice,
+                  input: segment.text,
+                  format: "mp3",
+                  instructions:
+                    variant.openAiStyle ??
+                    "Speak in a calm robotic synthetic voice with an ominous tone and minimal emotional variation.",
+                }),
+                signal: controller.signal,
+              });
+
+              if (!response.ok) {
+                return null;
+              }
+
+              const audioBlob = await response.blob();
+              const url = URL.createObjectURL(audioBlob);
+              return {
+                url,
+                volumeScale: variant.volumeScale,
+              } satisfies PreparedSpeechLayer;
+            }),
+          );
+
+          const validLayers = layers.filter((layer): layer is PreparedSpeechLayer => Boolean(layer));
+          if (validLayers.length < 1) {
+            for (const layer of validLayers) {
+              URL.revokeObjectURL(layer.url);
+            }
+            return null;
+          }
+
+          const entry: PreparedSpeechCacheEntry = {
+            layers: validLayers,
+          };
+          preparedSpeechCacheRef.current.set(cacheKey, entry);
+          return entry;
+        } catch {
+          return null;
+        } finally {
+          speechAbortControllersRef.current = speechAbortControllersRef.current.filter((item) => item !== controller);
+          preparedSpeechPromisesRef.current.delete(cacheKey);
+        }
+      })();
+
+      preparedSpeechPromisesRef.current.set(cacheKey, promise);
+      return promise;
+    },
+    [openAiApiKey, openAiTtsModel],
+  );
+
+  const playOpenAiLayeredSpeech = useCallback(
+    async (segment: QuestionSpeechSegment, cacheKey: string, normalizedMasterVolume: number, queueToken: number) => {
+      if (!openAiApiKey || !supportsOpenAiGeneration(segment)) {
+        return false;
+      }
+
+      const prepared = await prepareOpenAiLayeredSpeech(segment, cacheKey);
+      if (!prepared) {
+        return false;
+      }
+
+      if (speechQueueTokenRef.current !== queueToken) {
+        return false;
+      }
+
+      let fxContext = speechFxContextRef.current;
+      if (!fxContext || fxContext.state === "closed") {
+        fxContext = new AudioContext();
+        speechFxContextRef.current = fxContext;
+      }
+
+      if (fxContext.state === "suspended") {
+        try {
+          await fxContext.resume();
+        } catch {
+          return false;
+        }
+      }
+
+      const activeLayers = prepared.layers.map((layer) => {
+        const audio = new Audio(layer.url);
+        audio.preload = "auto";
+        audio.volume = clamp(normalizedMasterVolume * layer.volumeScale, 0, 1);
+
+        if (segment.profile.effectPreset !== "none" && fxContext) {
+          try {
+            const source = fxContext.createMediaElementSource(audio);
+            const lowpass = fxContext.createBiquadFilter();
+            lowpass.type = "lowpass";
+            lowpass.frequency.value =
+              segment.profile.effectPreset === "whisper" ? 880 : segment.profile.effectPreset === "echo" ? 2200 : 1200;
+
+            const highpass = fxContext.createBiquadFilter();
+            highpass.type = "highpass";
+            highpass.frequency.value =
+              segment.profile.effectPreset === "whisper" ? 85 : segment.profile.effectPreset === "echo" ? 120 : 70;
+
+            const dryGain = fxContext.createGain();
+            dryGain.gain.value = 0.9;
+
+            const delay = fxContext.createDelay(0.6);
+            delay.delayTime.value =
+              segment.profile.effectPreset === "whisper" ? 0.18 : segment.profile.effectPreset === "echo" ? 0.29 : 0.24;
+
+            const feedback = fxContext.createGain();
+            feedback.gain.value =
+              segment.profile.effectPreset === "whisper" ? 0.2 : segment.profile.effectPreset === "echo" ? 0.36 : 0.28;
+
+            const wetGain = fxContext.createGain();
+            wetGain.gain.value =
+              segment.profile.effectPreset === "whisper" ? 0.22 : segment.profile.effectPreset === "echo" ? 0.42 : 0.3;
+
+            source.connect(highpass);
+            highpass.connect(lowpass);
+            lowpass.connect(dryGain);
+            dryGain.connect(fxContext.destination);
+
+            lowpass.connect(delay);
+            delay.connect(wetGain);
+            wetGain.connect(fxContext.destination);
+            delay.connect(feedback);
+            feedback.connect(delay);
+
+            audio.volume = clamp(normalizedMasterVolume * layer.volumeScale * 0.92, 0, 1);
+            audio.playbackRate =
+              segment.profile.effectPreset === "whisper"
+                ? 0.82
+                : segment.profile.effectPreset === "echo"
+                  ? 0.9
+                  : 0.88;
+          } catch {
+            audio.playbackRate =
+              segment.profile.effectPreset === "whisper"
+                ? 0.88
+                : segment.profile.effectPreset === "echo"
+                  ? 0.93
+                  : 0.92;
+          }
+        }
+
+        speechAudioLayersRef.current.push({
+          audio,
+          volumeScale: layer.volumeScale,
+        });
+        return audio;
+      });
+
+      await Promise.all(activeLayers.map((audio) => audio.play().catch(() => void 0)));
+
+      if (speechQueueTokenRef.current !== queueToken) {
+        return false;
+      }
+
+      await Promise.all(
+        activeLayers.map(
+          (audio) =>
+            new Promise<void>((resolve) => {
+              const finish = () => {
+                audio.removeEventListener("ended", finish);
+                audio.removeEventListener("error", finish);
+                resolve();
+              };
+
+              audio.addEventListener("ended", finish);
+              audio.addEventListener("error", finish);
+            }),
+        ),
+      );
+
+      return true;
+    },
+    [openAiApiKey, prepareOpenAiLayeredSpeech],
+  );
+
+  const playTurbulenceOneShot = useCallback(() => {
+    const context = humAudioContextRef.current;
+    const outputGain = humOutputGainRef.current;
+
+    if (!context || !outputGain || context.state !== "running") {
+      return;
+    }
+
+    const now = context.currentTime;
+    const baseFrequency = 170 + Math.random() * 120;
+
+    const bodyOsc = context.createOscillator();
+    bodyOsc.type = "triangle";
+    bodyOsc.frequency.setValueAtTime(baseFrequency, now);
+    bodyOsc.frequency.exponentialRampToValueAtTime(baseFrequency * 0.72, now + 0.16);
+
+    const bodyFilter = context.createBiquadFilter();
+    bodyFilter.type = "bandpass";
+    bodyFilter.frequency.value = 260 + Math.random() * 180;
+    bodyFilter.Q.value = 0.85;
+
+    const bodyGain = context.createGain();
+    const intensity = 0.024 + Math.random() * 0.025;
+    bodyGain.gain.setValueAtTime(0.0001, now);
+    bodyGain.gain.exponentialRampToValueAtTime(intensity, now + 0.018);
+    bodyGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.2);
+
+    bodyOsc.connect(bodyFilter);
+    bodyFilter.connect(bodyGain);
+    bodyGain.connect(outputGain);
+
+    bodyOsc.start(now);
+    bodyOsc.stop(now + 0.22);
+
+    const rattleOsc = context.createOscillator();
+    rattleOsc.type = "sine";
+    rattleOsc.frequency.setValueAtTime(560 + Math.random() * 220, now);
+
+    const rattleGain = context.createGain();
+    rattleGain.gain.setValueAtTime(0.0001, now);
+    rattleGain.gain.exponentialRampToValueAtTime(intensity * 0.35, now + 0.008);
+    rattleGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.075);
+
+    rattleOsc.connect(rattleGain);
+    rattleGain.connect(outputGain);
+
+    rattleOsc.start(now);
+    rattleOsc.stop(now + 0.09);
+  }, []);
+
+  const playFootstepOneShot = useCallback(() => {
+    const context = humAudioContextRef.current;
+    const outputGain = humOutputGainRef.current;
+
+    if (!context || !outputGain || context.state !== "running") {
+      return;
+    }
+
+    const now = context.currentTime;
+    const stepGainAmount = 0.14 + Math.random() * 0.04;
+
+    const thumpOsc = context.createOscillator();
+    thumpOsc.type = "triangle";
+    thumpOsc.frequency.setValueAtTime(84 + Math.random() * 22, now);
+    thumpOsc.frequency.exponentialRampToValueAtTime(52 + Math.random() * 12, now + 0.08);
+
+    const thumpGain = context.createGain();
+    thumpGain.gain.setValueAtTime(0.0001, now);
+    thumpGain.gain.exponentialRampToValueAtTime(stepGainAmount, now + 0.008);
+    thumpGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.1);
+
+    const thumpFilter = context.createBiquadFilter();
+    thumpFilter.type = "lowpass";
+    thumpFilter.frequency.setValueAtTime(230, now);
+
+    thumpOsc.connect(thumpFilter);
+    thumpFilter.connect(thumpGain);
+    thumpGain.connect(outputGain);
+
+    thumpOsc.start(now);
+    thumpOsc.stop(now + 0.11);
+
+    const hissSource = context.createBufferSource();
+    const hissBuffer = context.createBuffer(1, Math.floor(context.sampleRate * 0.05), context.sampleRate);
+    const hissData = hissBuffer.getChannelData(0);
+    for (let i = 0; i < hissData.length; i++) {
+      hissData[i] = (Math.random() * 2 - 1) * 0.42;
+    }
+    hissSource.buffer = hissBuffer;
+
+    const hissFilter = context.createBiquadFilter();
+    hissFilter.type = "bandpass";
+    hissFilter.frequency.setValueAtTime(820 + Math.random() * 260, now);
+    hissFilter.Q.value = 0.7;
+
+    const hissGain = context.createGain();
+    hissGain.gain.setValueAtTime(0.0001, now);
+    hissGain.gain.exponentialRampToValueAtTime(stepGainAmount * 0.62, now + 0.004);
+    hissGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.055);
+
+    hissSource.connect(hissFilter);
+    hissFilter.connect(hissGain);
+    hissGain.connect(outputGain);
+
+    hissSource.start(now);
+    hissSource.stop(now + 0.055);
+  }, []);
+
+  const playFlickerZapOneShot = useCallback(() => {
+    const context = humAudioContextRef.current;
+    const outputGain = humOutputGainRef.current;
+
+    if (!context || !outputGain || context.state !== "running") {
+      return;
+    }
+
+    const now = context.currentTime;
+
+    const sskSource = context.createBufferSource();
+    const sskBuffer = context.createBuffer(1, Math.floor(context.sampleRate * 0.028), context.sampleRate);
+    const sskData = sskBuffer.getChannelData(0);
+
+    for (let i = 0; i < sskData.length; i++) {
+      const progress = i / sskData.length;
+      const envelope = Math.exp(-progress * 8.8);
+      sskData[i] = (Math.random() * 2 - 1) * envelope;
+    }
+
+    sskSource.buffer = sskBuffer;
+
+    const sskHighpass = context.createBiquadFilter();
+    sskHighpass.type = "highpass";
+    sskHighpass.frequency.setValueAtTime(2100 + Math.random() * 500, now);
+
+    const sskBandpass = context.createBiquadFilter();
+    sskBandpass.type = "bandpass";
+    sskBandpass.frequency.setValueAtTime(3300 + Math.random() * 800, now);
+    sskBandpass.Q.value = 1.35;
+
+    const sskGain = context.createGain();
+    const baseLevel = 0.016 + Math.random() * 0.005;
+    sskGain.gain.setValueAtTime(0.0001, now);
+    sskGain.gain.exponentialRampToValueAtTime(baseLevel, now + 0.0015);
+    sskGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.028);
+
+    sskSource.connect(sskHighpass);
+    sskHighpass.connect(sskBandpass);
+    sskBandpass.connect(sskGain);
+    sskGain.connect(outputGain);
+
+    sskSource.start(now);
+    sskSource.stop(now + 0.03);
+  }, []);
+
+  const playAlienAirwaveOneShot = useCallback(() => {
+    const context = humAudioContextRef.current;
+    const outputGain = humOutputGainRef.current;
+
+    if (!context || !outputGain || context.state !== "running") {
+      return;
+    }
+
+    const now = context.currentTime;
+
+    const shockOsc = context.createOscillator();
+    shockOsc.type = "triangle";
+    shockOsc.frequency.setValueAtTime(54, now);
+    shockOsc.frequency.exponentialRampToValueAtTime(31, now + 0.46);
+
+    const shockFilter = context.createBiquadFilter();
+    shockFilter.type = "lowpass";
+    shockFilter.frequency.setValueAtTime(180, now);
+
+    const shockGain = context.createGain();
+    shockGain.gain.setValueAtTime(0.0001, now);
+    shockGain.gain.exponentialRampToValueAtTime(0.12, now + 0.012);
+    shockGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.5);
+
+    shockOsc.connect(shockFilter);
+    shockFilter.connect(shockGain);
+    shockGain.connect(outputGain);
+
+    shockOsc.start(now);
+    shockOsc.stop(now + 0.52);
+
+    const waveNoiseSource = context.createBufferSource();
+    const waveNoiseBuffer = context.createBuffer(1, Math.floor(context.sampleRate * 0.34), context.sampleRate);
+    const waveNoiseData = waveNoiseBuffer.getChannelData(0);
+    for (let i = 0; i < waveNoiseData.length; i++) {
+      waveNoiseData[i] = (Math.random() * 2 - 1) * 0.42;
+    }
+    waveNoiseSource.buffer = waveNoiseBuffer;
+
+    const waveHighpass = context.createBiquadFilter();
+    waveHighpass.type = "highpass";
+    waveHighpass.frequency.setValueAtTime(430, now);
+
+    const waveBandpass = context.createBiquadFilter();
+    waveBandpass.type = "bandpass";
+    waveBandpass.frequency.setValueAtTime(980, now);
+    waveBandpass.Q.value = 0.72;
+
+    const waveGain = context.createGain();
+    waveGain.gain.setValueAtTime(0.0001, now);
+    waveGain.gain.exponentialRampToValueAtTime(0.028, now + 0.022);
+    waveGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.34);
+
+    waveNoiseSource.connect(waveHighpass);
+    waveHighpass.connect(waveBandpass);
+    waveBandpass.connect(waveGain);
+    waveGain.connect(outputGain);
+
+    waveNoiseSource.start(now);
+    waveNoiseSource.stop(now + 0.35);
+  }, []);
+
+  const playEndingRumbleOneShot = useCallback(() => {
+    const context = humAudioContextRef.current;
+    const outputGain = humOutputGainRef.current;
+
+    if (!context || !outputGain || context.state !== "running") {
+      return;
+    }
+
+    const now = context.currentTime;
+
+    const rumbleOsc = context.createOscillator();
+    rumbleOsc.type = "triangle";
+    rumbleOsc.frequency.setValueAtTime(42 + Math.random() * 8, now);
+    rumbleOsc.frequency.exponentialRampToValueAtTime(24 + Math.random() * 4, now + 0.8);
+
+    const rumbleFilter = context.createBiquadFilter();
+    rumbleFilter.type = "lowpass";
+    rumbleFilter.frequency.setValueAtTime(180, now);
+
+    const rumbleGain = context.createGain();
+    rumbleGain.gain.setValueAtTime(0.0001, now);
+    rumbleGain.gain.exponentialRampToValueAtTime(0.06, now + 0.08);
+    rumbleGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.92);
+
+    rumbleOsc.connect(rumbleFilter);
+    rumbleFilter.connect(rumbleGain);
+    rumbleGain.connect(outputGain);
+
+    rumbleOsc.start(now);
+    rumbleOsc.stop(now + 0.95);
+  }, []);
+
+  const triggerAlienAirwaveStun = useCallback((intensity = 1) => {
+    const now = performance.now();
+    stunStartedAtRef.current = now;
+    stunEndsAtRef.current = now + 1700;
+    stunIntensityRef.current = clamp(intensity, 0.2, 1);
+    playAlienAirwaveOneShot();
+  }, [playAlienAirwaveOneShot]);
+
+  const triggerAlienHeadReaction = useCallback((delta: number) => {
+    const now = performance.now();
+    headReactionStartedAtRef.current = now;
+
+    if (delta > 0) {
+      headReactionModeRef.current = "no";
+      headJoltEndsAtRef.current = now + 420;
+      headJoltDirectionRef.current = Math.random() < 0.5 ? -1 : 1;
+      return;
+    }
+
+    if (delta < 0) {
+      headReactionModeRef.current = "yes";
+      headJoltEndsAtRef.current = now + 960;
+      headJoltDirectionRef.current = 1;
+      return;
+    }
+
+    headReactionModeRef.current = "none";
+    headJoltEndsAtRef.current = now;
+  }, []);
+
+  const scheduleTurbulenceSounds = useCallback(() => {
+    if (turbulenceTimerRef.current !== null) {
+      window.clearTimeout(turbulenceTimerRef.current);
+      turbulenceTimerRef.current = null;
+    }
+
+    const scheduleNext = () => {
+      playTurbulenceOneShot();
+      const nextDelay = 2200 + Math.random() * 4800;
+      turbulenceTimerRef.current = window.setTimeout(scheduleNext, nextDelay);
+    };
+
+    const initialDelay = 1200 + Math.random() * 2600;
+    turbulenceTimerRef.current = window.setTimeout(scheduleNext, initialDelay);
+  }, [playTurbulenceOneShot]);
+
+  const startShipHum = useCallback(async () => {
+    if (humNodesRef.current) {
+      return;
+    }
+
+    let context = humAudioContextRef.current;
+    if (!context || context.state === "closed") {
+      context = new AudioContext();
+      humAudioContextRef.current = context;
+    }
+
+    if (context.state !== "running") {
+      try {
+        await context.resume();
+      } catch {
+        return;
+      }
+    }
+
+    const now = context.currentTime;
+
+    let outputGain = humOutputGainRef.current;
+    if (!outputGain) {
+      outputGain = context.createGain();
+      outputGain.gain.setValueAtTime(Math.max(masterVolumeRef.current, 0.0001), now);
+      outputGain.connect(context.destination);
+      humOutputGainRef.current = outputGain;
+    }
+
+    const highpass = context.createBiquadFilter();
+    highpass.type = "highpass";
+    highpass.frequency.value = 42;
+
+    const lowpass = context.createBiquadFilter();
+    lowpass.type = "lowpass";
+    lowpass.frequency.value = 880;
+    lowpass.Q.value = 0.95;
+
+    const masterGain = context.createGain();
+    masterGain.gain.setValueAtTime(0.0001, now);
+    masterGain.gain.exponentialRampToValueAtTime(0.2, now + 0.9);
+
+    highpass.connect(lowpass);
+    lowpass.connect(masterGain);
+    masterGain.connect(outputGain);
+
+    const osc1 = context.createOscillator();
+    osc1.type = "triangle";
+    osc1.frequency.setValueAtTime(84, now);
+    const osc1Gain = context.createGain();
+    osc1Gain.gain.value = 0.16;
+    osc1.connect(osc1Gain);
+    osc1Gain.connect(highpass);
+
+    const osc2 = context.createOscillator();
+    osc2.type = "sine";
+    osc2.frequency.setValueAtTime(126, now);
+    const osc2Gain = context.createGain();
+    osc2Gain.gain.value = 0.082;
+    osc2.connect(osc2Gain);
+    osc2Gain.connect(highpass);
+
+    const osc3 = context.createOscillator();
+    osc3.type = "sine";
+    osc3.frequency.setValueAtTime(188, now);
+    const osc3Gain = context.createGain();
+    osc3Gain.gain.value = 0.044;
+    osc3.connect(osc3Gain);
+    osc3Gain.connect(highpass);
+
+    const oscillators = [osc1, osc2, osc3];
+
+    for (const osc of oscillators) {
+      osc.start(now);
+    }
+
+    humNodesRef.current = {
+      masterGain,
+      oscillators,
+    };
+
+    scheduleTurbulenceSounds();
+  }, [scheduleTurbulenceSounds]);
+
+  const applyDarkHorrorAmbientVolume = useCallback(() => {
+    const ambientAudio = darkHorrorAmbientAudioRef.current;
+    if (!ambientAudio) {
+      return;
+    }
+
+    ambientAudio.volume = clamp(
+      masterVolumeRef.current * DARK_HORROR_AMBIENT_VOLUME_SCALE * darkHorrorAmbientGainRef.current,
+      0,
+      1,
+    );
+  }, []);
+
+  const fadeDarkHorrorAmbientTo = useCallback(
+    (targetGain: number, durationMs: number, onComplete?: () => void) => {
+      const target = clamp(targetGain, 0, 1);
+      const start = darkHorrorAmbientGainRef.current;
+
+      if (darkHorrorAmbientFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(darkHorrorAmbientFadeFrameRef.current);
+        darkHorrorAmbientFadeFrameRef.current = null;
+      }
+
+      if (durationMs <= 0 || Math.abs(target - start) < 0.0001) {
+        darkHorrorAmbientGainRef.current = target;
+        applyDarkHorrorAmbientVolume();
+        if (onComplete) onComplete();
+        return;
+      }
+
+      const startTime = performance.now();
+      const animateFade = () => {
+        const elapsedMs = performance.now() - startTime;
+        const t = clamp(elapsedMs / durationMs, 0, 1);
+        const eased = 1 - Math.pow(1 - t, 2);
+        darkHorrorAmbientGainRef.current = THREE.MathUtils.lerp(start, target, eased);
+        applyDarkHorrorAmbientVolume();
+
+        if (t < 1) {
+          darkHorrorAmbientFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+          return;
+        }
+
+        darkHorrorAmbientFadeFrameRef.current = null;
+        if (onComplete) onComplete();
+      };
+
+      darkHorrorAmbientFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+    },
+    [applyDarkHorrorAmbientVolume],
+  );
+
+  const ensureDarkHorrorAmbientPlaying = useCallback(() => {
+    const ambientAudio = darkHorrorAmbientAudioRef.current;
+    if (!ambientAudio) {
+      return;
+    }
+
+    const bringToQuietLevel = () => {
+      fadeDarkHorrorAmbientTo(1, 2200);
+    };
+
+    if (!ambientAudio.paused) {
+      bringToQuietLevel();
+      return;
+    }
+
+    const playAttempt = ambientAudio.play();
+    if (playAttempt && typeof playAttempt.then === "function") {
+      void playAttempt
+        .then(() => {
+          bringToQuietLevel();
+        })
+        .catch(() => {
+          return;
+        });
+      return;
+    }
+
+    bringToQuietLevel();
+  }, [fadeDarkHorrorAmbientTo]);
+
+  const restartDarkHorrorAmbientWithFade = useCallback(() => {
+    const ambientAudio = darkHorrorAmbientAudioRef.current;
+    if (!ambientAudio) {
+      return;
+    }
+
+    fadeDarkHorrorAmbientTo(0, 420, () => {
+      ambientAudio.currentTime = 0;
+      const playAttempt = ambientAudio.play();
+      if (playAttempt && typeof playAttempt.then === "function") {
+        void playAttempt
+          .then(() => {
+            fadeDarkHorrorAmbientTo(1, 1600);
+          })
+          .catch(() => {
+            return;
+          });
+        return;
+      }
+
+      fadeDarkHorrorAmbientTo(1, 1600);
+    });
+  }, [fadeDarkHorrorAmbientTo]);
+
+  const applyOceanAmbienceVolume = useCallback(() => {
+    const oceanAmbience = oceanAmbienceAudioRef.current;
+    if (!oceanAmbience) {
+      return;
+    }
+
+    oceanAmbience.volume = clamp(masterVolumeRef.current * OCEAN_AMBIENCE_VOLUME_SCALE * oceanAmbienceGainRef.current, 0, 1);
+  }, []);
+
+  const fadeOceanAmbienceTo = useCallback(
+    (targetGain: number, durationMs: number) => {
+      const target = clamp(targetGain, 0, 1);
+      const start = oceanAmbienceGainRef.current;
+
+      if (oceanAmbienceFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(oceanAmbienceFadeFrameRef.current);
+        oceanAmbienceFadeFrameRef.current = null;
+      }
+
+      if (durationMs <= 0 || Math.abs(target - start) < 0.0001) {
+        oceanAmbienceGainRef.current = target;
+        applyOceanAmbienceVolume();
+        return;
+      }
+
+      const startTime = performance.now();
+      const animateFade = () => {
+        const elapsedMs = performance.now() - startTime;
+        const t = clamp(elapsedMs / durationMs, 0, 1);
+        const eased = 1 - Math.pow(1 - t, 2);
+        oceanAmbienceGainRef.current = THREE.MathUtils.lerp(start, target, eased);
+        applyOceanAmbienceVolume();
+
+        if (t < 1) {
+          oceanAmbienceFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+          return;
+        }
+
+        oceanAmbienceFadeFrameRef.current = null;
+      };
+
+      oceanAmbienceFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+    },
+    [applyOceanAmbienceVolume],
+  );
+
+  const playDistantExplosionOneShot = useCallback(() => {
+    const distantExplosion = distantExplosionAudioRef.current;
+    if (!distantExplosion) {
+      return;
+    }
+
+    try {
+      distantExplosion.pause();
+      distantExplosion.currentTime = 0;
+      distantExplosion.volume = clamp(masterVolumeRef.current * DISTANT_EXPLOSION_VOLUME_SCALE, 0, 1);
+      const playAttempt = distantExplosion.play();
+      if (playAttempt && typeof playAttempt.then === "function") {
+        void playAttempt.catch(() => {
+          return;
+        });
+      }
+    } catch {
+      return;
+    }
+  }, []);
+
+  const applyEndMusicVolume = useCallback(() => {
+    const endMusic = endMusicAudioRef.current;
+    if (!endMusic) {
+      return;
+    }
+
+    endMusic.volume = clamp(masterVolumeRef.current * ENDMUSIC_VOLUME_SCALE * endMusicGainRef.current, 0, 1);
+  }, []);
+
+  const fadeEndMusicTo = useCallback(
+    (targetGain: number, durationMs: number) => {
+      const target = clamp(targetGain, 0, 1);
+      const start = endMusicGainRef.current;
+
+      if (endMusicFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(endMusicFadeFrameRef.current);
+        endMusicFadeFrameRef.current = null;
+      }
+
+      if (durationMs <= 0 || Math.abs(target - start) < 0.0001) {
+        endMusicGainRef.current = target;
+        applyEndMusicVolume();
+        return;
+      }
+
+      const startTime = performance.now();
+      const animateFade = () => {
+        const elapsedMs = performance.now() - startTime;
+        const t = clamp(elapsedMs / durationMs, 0, 1);
+        const eased = 1 - Math.pow(1 - t, 2);
+        endMusicGainRef.current = THREE.MathUtils.lerp(start, target, eased);
+        applyEndMusicVolume();
+
+        if (t < 1) {
+          endMusicFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+          return;
+        }
+
+        endMusicFadeFrameRef.current = null;
+      };
+
+      endMusicFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+    },
+    [applyEndMusicVolume],
+  );
+
+  const applyBuildupVolume = useCallback(() => {
+    const buildup = buildupAudioRef.current;
+    if (!buildup) {
+      return;
+    }
+
+    buildup.volume = clamp(masterVolumeRef.current * BUILDUP_VOLUME_SCALE * buildupGainRef.current, 0, 1);
+  }, []);
+
+  const fadeBuildupTo = useCallback(
+    (targetGain: number, durationMs: number) => {
+      const target = clamp(targetGain, 0, 1);
+      const start = buildupGainRef.current;
+
+      if (buildupFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(buildupFadeFrameRef.current);
+        buildupFadeFrameRef.current = null;
+      }
+
+      if (durationMs <= 0 || Math.abs(target - start) < 0.0001) {
+        buildupGainRef.current = target;
+        applyBuildupVolume();
+        return;
+      }
+
+      const startTime = performance.now();
+      const animateFade = () => {
+        const elapsedMs = performance.now() - startTime;
+        const t = clamp(elapsedMs / durationMs, 0, 1);
+        const eased = 1 - Math.pow(1 - t, 2);
+        buildupGainRef.current = THREE.MathUtils.lerp(start, target, eased);
+        applyBuildupVolume();
+
+        if (t < 1) {
+          buildupFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+          return;
+        }
+
+        buildupFadeFrameRef.current = null;
+      };
+
+      buildupFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+    },
+    [applyBuildupVolume],
+  );
+
+  useEffect(() => {
+    const normalized = Math.max(0, Math.min(1, masterVolume / 100));
+    masterVolumeRef.current = normalized;
+
+    const context = humAudioContextRef.current;
+    const outputGain = humOutputGainRef.current;
+    if (context && outputGain && context.state !== "closed") {
+      const now = context.currentTime;
+      outputGain.gain.cancelScheduledValues(now);
+      outputGain.gain.setTargetAtTime(normalized, now, 0.03);
+    }
+
+    const mediaElements = document.querySelectorAll("audio, video");
+    mediaElements.forEach((element) => {
+      const media = element as HTMLMediaElement;
+      media.volume = normalized;
+    });
+
+    if (buttonClickAudioRef.current) {
+      buttonClickAudioRef.current.volume = Math.min(1, normalized * 0.9);
+    }
+
+    if (revealAudioRef.current && !isRevealingRef.current) {
+      revealAudioRef.current.volume = Math.min(1, normalized * 0.42);
+    }
+
+    applyDarkHorrorAmbientVolume();
+    applyOceanAmbienceVolume();
+    applyEndMusicVolume();
+    applyBuildupVolume();
+
+    if (distantExplosionAudioRef.current) {
+      distantExplosionAudioRef.current.volume = clamp(normalized * DISTANT_EXPLOSION_VOLUME_SCALE, 0, 1);
+    }
+
+    if (speechAudioLayersRef.current.length > 0) {
+      for (const layer of speechAudioLayersRef.current) {
+        layer.audio.volume = clamp(normalized * layer.volumeScale, 0, 1);
+      }
+    }
+  }, [
+    applyBuildupVolume,
+    applyDarkHorrorAmbientVolume,
+    applyEndMusicVolume,
+    applyOceanAmbienceVolume,
+    masterVolume,
+  ]);
+
+  useEffect(() => {
+    const clickAudio = new Audio("/switch_002.ogg");
+    clickAudio.preload = "auto";
+    clickAudio.volume = Math.min(1, masterVolumeRef.current * 0.9);
+    buttonClickAudioRef.current = clickAudio;
+
+    const revealAudio = new Audio("/horrorLoad.mp3");
+    revealAudio.preload = "auto";
+    revealAudio.loop = false;
+    revealAudio.volume = Math.min(1, masterVolumeRef.current * 0.42);
+    revealAudioRef.current = revealAudio;
+
+    const darkHorrorAmbient = new Audio("/universfield-dark-horror-soundscape-345814.mp3");
+    darkHorrorAmbient.preload = "auto";
+    darkHorrorAmbient.loop = false;
+    darkHorrorAmbient.currentTime = 0;
+    darkHorrorAmbientGainRef.current = 0;
+    darkHorrorAmbientAudioRef.current = darkHorrorAmbient;
+    applyDarkHorrorAmbientVolume();
+
+    const handleAmbientRestart = () => {
+      restartDarkHorrorAmbientWithFade();
+    };
+
+    darkHorrorAmbient.addEventListener("ended", handleAmbientRestart);
+    darkHorrorAmbient.addEventListener("error", handleAmbientRestart);
+    darkHorrorAmbient.addEventListener("stalled", handleAmbientRestart);
+
+    const oceanAmbience = new Audio("/mixkit-diving-sea-ambience-1205.wav");
+    oceanAmbience.preload = "auto";
+    oceanAmbience.loop = true;
+    oceanAmbience.currentTime = 0;
+    oceanAmbienceGainRef.current = 0;
+    oceanAmbienceAudioRef.current = oceanAmbience;
+    applyOceanAmbienceVolume();
+
+    const distantExplosion = new Audio("/freesound_community-distant-explosion-47562.mp3");
+    distantExplosion.preload = "auto";
+    distantExplosion.loop = false;
+    distantExplosion.volume = clamp(masterVolumeRef.current * DISTANT_EXPLOSION_VOLUME_SCALE, 0, 1);
+    distantExplosionAudioRef.current = distantExplosion;
+
+    const endMusic = new Audio("/endmusic.mp3");
+    endMusic.preload = "auto";
+    endMusic.loop = true;
+    endMusic.currentTime = 0;
+    endMusicGainRef.current = 0;
+    endMusicAudioRef.current = endMusic;
+    applyEndMusicVolume();
+
+    const buildup = new Audio("/buildup.mp3");
+    buildup.preload = "auto";
+    buildup.loop = true;
+    buildup.currentTime = 0;
+    buildupGainRef.current = 0;
+    buildupAudioRef.current = buildup;
+    applyBuildupVolume();
+
+    return () => {
+      clickAudio.pause();
+      buttonClickAudioRef.current = null;
+      revealAudio.pause();
+      revealAudioRef.current = null;
+
+      darkHorrorAmbient.removeEventListener("ended", handleAmbientRestart);
+      darkHorrorAmbient.removeEventListener("error", handleAmbientRestart);
+      darkHorrorAmbient.removeEventListener("stalled", handleAmbientRestart);
+      darkHorrorAmbient.pause();
+      darkHorrorAmbient.currentTime = 0;
+      darkHorrorAmbientAudioRef.current = null;
+
+      oceanAmbience.pause();
+      oceanAmbience.currentTime = 0;
+      oceanAmbienceAudioRef.current = null;
+
+      distantExplosion.pause();
+      distantExplosion.currentTime = 0;
+      distantExplosionAudioRef.current = null;
+
+      endMusic.pause();
+      endMusic.currentTime = 0;
+      endMusicAudioRef.current = null;
+
+      buildup.pause();
+      buildup.currentTime = 0;
+      buildupAudioRef.current = null;
+
+      if (darkHorrorAmbientFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(darkHorrorAmbientFadeFrameRef.current);
+        darkHorrorAmbientFadeFrameRef.current = null;
+      }
+
+      if (oceanAmbienceFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(oceanAmbienceFadeFrameRef.current);
+        oceanAmbienceFadeFrameRef.current = null;
+      }
+
+      if (endMusicFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(endMusicFadeFrameRef.current);
+        endMusicFadeFrameRef.current = null;
+      }
+
+      if (buildupFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(buildupFadeFrameRef.current);
+        buildupFadeFrameRef.current = null;
+      }
+    };
+  }, [
+    applyBuildupVolume,
+    applyDarkHorrorAmbientVolume,
+    applyEndMusicVolume,
+    applyOceanAmbienceVolume,
+    restartDarkHorrorAmbientWithFade,
+  ]);
+
+  useEffect(() => {
+    const endMusic = endMusicAudioRef.current;
+    if (!endMusic) {
+      return;
+    }
+
+    if (phase === "ending" && endingPanelVisible) {
+      const playAttempt = endMusic.play();
+      if (playAttempt && typeof playAttempt.then === "function") {
+        void playAttempt
+          .then(() => {
+            fadeEndMusicTo(1, 1600);
+          })
+          .catch(() => {
+            return;
+          });
+      } else {
+        fadeEndMusicTo(1, 1600);
+      }
+      return;
+    }
+
+    fadeEndMusicTo(0, 700);
+  }, [endingPanelVisible, fadeEndMusicTo, phase]);
+
+  useEffect(() => {
+    if (!speechSupported) {
+      speechVoiceRef.current = null;
+      return;
+    }
+
+    const syncVoice = () => {
+      const voices = window.speechSynthesis.getVoices();
+      speechVoiceRef.current = pickCreepyVoice(voices);
+    };
+
+    syncVoice();
+    window.speechSynthesis.addEventListener("voiceschanged", syncVoice);
+
+    return () => {
+      window.speechSynthesis.removeEventListener("voiceschanged", syncVoice);
+    };
+  }, [speechSupported]);
+
+  const handleGlobalButtonClick = (event: React.MouseEvent<HTMLElement>) => {
+    const target = event.target as HTMLElement | null;
+    if (!target) return;
+
+    const clickedButton = target.closest("button");
+    if (!clickedButton) return;
+
+    const clickAudio = buttonClickAudioRef.current;
+    if (!clickAudio) return;
+
+    clickAudio.currentTime = 0;
+    void clickAudio.play().catch(() => {
+      return;
+    });
+  };
+
+  useEffect(() => {
+    const applyMediaVolume = () => {
+      const normalized = masterVolumeRef.current;
+      const mediaElements = document.querySelectorAll("audio, video");
+      mediaElements.forEach((element) => {
+        const media = element as HTMLMediaElement;
+        media.volume = normalized;
+      });
+    };
+
+    applyMediaVolume();
+    const observer = new MutationObserver(() => {
+      applyMediaVolume();
+    });
+
+    observer.observe(document.body, { childList: true, subtree: true });
+
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (phase !== "questions" || !currentTurn) {
+      const resetTimeoutId = window.setTimeout(() => {
+        setTypedAlienText("");
+        setAnswersVisible(false);
+      }, 0);
+
+      return () => {
+        window.clearTimeout(resetTimeoutId);
+      };
+    }
+
+    if (isRevealing) {
+      const resetTimeoutId = window.setTimeout(() => {
+        setTypedAlienText("");
+        setAnswersVisible(false);
+      }, 0);
+
+      return () => {
+        window.clearTimeout(resetTimeoutId);
+      };
+    }
+
+    const fullText = currentTurn.alienLine.replace("Alien Vessel: ", "");
+    let charIndex = 0;
+    let timeoutId = 0;
+
+    const typeStep = () => {
+      const charsPerTick = fullText.length > 220 ? 2 : 1;
+      charIndex = Math.min(fullText.length, charIndex + charsPerTick);
+      setTypedAlienText(fullText.slice(0, charIndex));
+
+      if (charIndex < fullText.length) {
+        timeoutId = window.setTimeout(typeStep, 26);
+      } else {
+        setAnswersVisible(true);
+      }
+    };
+
+    timeoutId = window.setTimeout(() => {
+      setTypedAlienText("");
+      setAnswersVisible(false);
+      typeStep();
+    }, 110);
+
+    return () => {
+      window.clearTimeout(timeoutId);
+    };
+  }, [phase, turnIndex, currentTurn, isRevealing]);
+
+  useEffect(() => {
+    const oceanAmbience = oceanAmbienceAudioRef.current;
+    if (!oceanAmbience) {
+      return;
+    }
+
+    const isOceanQuestionActive =
+      phase === "questions" && turnIndex === OCEAN_SOUNDS_TURN_INDEX && !isRevealing;
+
+    if (isOceanQuestionActive) {
+      const playAttempt = oceanAmbience.play();
+      if (playAttempt && typeof playAttempt.then === "function") {
+        void playAttempt
+          .then(() => {
+            fadeOceanAmbienceTo(1, 1500);
+          })
+          .catch(() => {
+            return;
+          });
+      } else {
+        fadeOceanAmbienceTo(1, 1500);
+      }
+      return;
+    }
+
+    fadeOceanAmbienceTo(0, 600);
+  }, [fadeOceanAmbienceTo, isRevealing, phase, turnIndex]);
+
+  useEffect(() => {
+    if (!voiceEnabled || phase !== "questions" || !currentTurn || isRevealing || !openAiApiKey) {
+      return;
+    }
+
+    const segments = extractQuestionSpeechSegments(currentTurn.alienLine);
+    for (let segmentIndex = 0; segmentIndex < segments.length; segmentIndex++) {
+      const segment = segments[segmentIndex];
+      if (!supportsOpenAiGeneration(segment)) {
+        continue;
+      }
+
+      const cacheKey = getSpeechSegmentCacheKey(turnIndex, segmentIndex, segment);
+      void prepareOpenAiLayeredSpeech(segment, cacheKey);
+    }
+  }, [voiceEnabled, phase, currentTurn, isRevealing, openAiApiKey, turnIndex, prepareOpenAiLayeredSpeech]);
+
+  useEffect(() => {
+    if (!speechSupported || !voiceEnabled || phase !== "questions" || !currentTurn || isRevealing) {
+      stopQuestionSpeech();
+      if (phase !== "questions") {
+        spokenTurnRef.current = null;
+      }
+      return;
+    }
+
+    if (spokenTurnRef.current === turnIndex) {
+      return;
+    }
+
+    spokenTurnRef.current = turnIndex;
+    window.speechSynthesis.cancel();
+
+    const speechSegments = extractQuestionSpeechSegments(currentTurn.alienLine);
+    if (speechSegments.length === 0) {
+      return;
+    }
+
+    const speakDelayMs = 1000;
+    const queueToken = speechQueueTokenRef.current;
+
+    speechDelayTimeoutRef.current = window.setTimeout(() => {
+      if (speechQueueTokenRef.current !== queueToken) {
+        speechDelayTimeoutRef.current = null;
+        return;
+      }
+
+      const normalizedMasterVolume = masterVolume / 100;
+
+      const speakWithSynth = (segmentText: string, variant: SpeechVariant) =>
+        new Promise<void>((resolve) => {
+          if (speechQueueTokenRef.current !== queueToken) {
+            resolve();
+            return;
+          }
+
+          const utterance = new SpeechSynthesisUtterance(segmentText);
+          utterance.voice = speechVoiceRef.current;
+          utterance.lang = speechVoiceRef.current?.lang ?? "en-US";
+          utterance.rate = clamp(variant.rate, 0.55, 1.08);
+          utterance.pitch = clamp(variant.pitch, 0, 1.2);
+          utterance.volume = clamp(normalizedMasterVolume * variant.volumeScale, 0, 1);
+          utterance.onend = () => resolve();
+          utterance.onerror = () => resolve();
+          window.speechSynthesis.speak(utterance);
+        });
+
+      const runSpeechQueue = async () => {
+        for (let segmentIndex = 0; segmentIndex < speechSegments.length; segmentIndex++) {
+          const segment = speechSegments[segmentIndex];
+          if (speechQueueTokenRef.current !== queueToken) {
+            break;
+          }
+
+          if (/why\s+persist\??$/i.test(segment.text)) {
+            triggerAlienAirwaveStun(0.5);
+          }
+
+          const cacheKey = getSpeechSegmentCacheKey(turnIndex, segmentIndex, segment);
+          if (segment.profile.openAiOnly) {
+            const usedOpenAiOnly = await playOpenAiLayeredSpeech(segment, cacheKey, normalizedMasterVolume, queueToken);
+            if (usedOpenAiOnly) {
+              continue;
+            }
+          }
+
+          if (segment.profile.overlayAlienOnOpenAi) {
+            const isFinalWhyPersist = /why\s+persist\??$/i.test(segment.text);
+            const [usedOpenAiPlayback] = await Promise.all([
+              playOpenAiLayeredSpeech(segment, cacheKey, normalizedMasterVolume, queueToken),
+              speakWithSynth(segment.text, {
+                rate: isFinalWhyPersist ? 0.5 : segment.profile.effectPreset === "whisper" ? 0.6 : 0.66,
+                pitch: isFinalWhyPersist ? 0 : segment.profile.effectPreset === "whisper" ? 0.08 : 0.16,
+                volumeScale: isFinalWhyPersist ? 0.52 : segment.profile.effectPreset === "whisper" ? 0.2 : 0.25,
+              }),
+            ]);
+
+            if (usedOpenAiPlayback) {
+              continue;
+            }
+          }
+
+          const usedOpenAiPlayback = await playOpenAiLayeredSpeech(segment, cacheKey, normalizedMasterVolume, queueToken);
+          if (usedOpenAiPlayback) {
+            continue;
+          }
+
+          for (const variant of segment.profile.variants) {
+            if (speechQueueTokenRef.current !== queueToken) {
+              break;
+            }
+            await speakWithSynth(segment.text, variant);
+          }
+        }
+      };
+
+      void runSpeechQueue();
+
+      speechDelayTimeoutRef.current = null;
+    }, speakDelayMs);
+
+    return () => {
+      if (speechDelayTimeoutRef.current !== null) {
+        window.clearTimeout(speechDelayTimeoutRef.current);
+        speechDelayTimeoutRef.current = null;
+      }
+
+      window.speechSynthesis.cancel();
+    };
+  }, [
+    speechSupported,
+    voiceEnabled,
+    phase,
+    currentTurn,
+    turnIndex,
+    isRevealing,
+    masterVolume,
+    playOpenAiLayeredSpeech,
+    stopQuestionSpeech,
+    triggerAlienAirwaveStun,
+  ]);
+
+  useEffect(() => {
+    revealProgressRef.current = revealProgress;
+  }, [revealProgress]);
+
+  useEffect(() => {
+    phaseRef.current = phase;
+
+    if (phase === "ending") {
+      const now = performance.now();
+      endingCinematicRef.current = {
+        stage: "room-shake-flash",
+        stageStartedAt: now,
+        blastStartedAt: 0,
+        lastRumbleAt: 0,
+      };
+      endingBlackoutOpacityRef.current = 0;
+      setEndingBlackoutOpacity(0);
+      endingFlashOpacityRef.current = 0;
+      setEndingFlashOpacity(0);
+      endingPanelVisibleRef.current = false;
+      setEndingPanelVisible(false);
+      return;
+    }
+
+    endingCinematicRef.current = {
+      stage: "inactive",
+      stageStartedAt: 0,
+      blastStartedAt: 0,
+      lastRumbleAt: 0,
+    };
+    endingBlackoutOpacityRef.current = 0;
+    setEndingBlackoutOpacity(0);
+    endingFlashOpacityRef.current = 0;
+    setEndingFlashOpacity(0);
+    endingPanelVisibleRef.current = false;
+    setEndingPanelVisible(false);
+  }, [phase]);
+
+  useEffect(() => {
+    endingPanelVisibleRef.current = endingPanelVisible;
+  }, [endingPanelVisible]);
+
+  useEffect(() => {
+    turnIndexRef.current = turnIndex;
+  }, [turnIndex]);
+
+  useEffect(() => {
+    if (phase === "questions" && currentTurn) {
+      currentQuestionCharsRef.current = currentTurn.alienLine.replace("Alien Vessel: ", "").length;
+      return;
+    }
+
+    currentQuestionCharsRef.current = 0;
+    typedQuestionCharsRef.current = 0;
+  }, [phase, currentTurn]);
+
+  useEffect(() => {
+    typedQuestionCharsRef.current = typedAlienText.length;
+  }, [typedAlienText]);
+
+  useEffect(() => {
+    isRevealingRef.current = isRevealing;
+  }, [isRevealing]);
+
+  useEffect(() => {
+    const revealAudio = revealAudioRef.current;
+    if (!revealAudio) {
+      return;
+    }
+
+    if (!isRevealing) {
+      revealAudio.pause();
+      revealAudio.currentTime = 0;
+      revealAudioStartedRef.current = false;
+      return;
+    }
+
+    const fadeIn = Math.min(1, revealProgress / 0.22);
+    const fadeOut = revealProgress > 0.62 ? Math.max(0, 1 - (revealProgress - 0.62) / 0.38) : 1;
+    const envelope = fadeIn * fadeOut;
+    revealAudio.volume = Math.min(1, masterVolumeRef.current * 0.42 * envelope);
+  }, [isRevealing, revealProgress]);
+
+  useEffect(() => {
+    return () => {
+      stopQuestionSpeech();
+      clearPreparedSpeechCache();
+      if (speechFxContextRef.current && speechFxContextRef.current.state !== "closed") {
+        void speechFxContextRef.current.close();
+      }
+      speechFxContextRef.current = null;
+      void stopShipHum();
+    };
+  }, [clearPreparedSpeechCache, stopQuestionSpeech, stopShipHum]);
+
+  useEffect(() => {
+    const mountEl = mountRef.current;
+    if (!mountEl) return;
+
+    const scene = new THREE.Scene();
+    const introBackgroundColor = new THREE.Color("#010102");
+    const gameplayBackgroundColor = new THREE.Color("#05070c");
+    const introFog = new THREE.Fog("#010102", 6.4, 17.5);
+    const gameplayFog = new THREE.Fog("#05070c", 4.8, 15.5);
+    scene.background = introBackgroundColor;
+    scene.fog = introFog;
+
+    const camera = new THREE.PerspectiveCamera(65, mountEl.clientWidth / mountEl.clientHeight, 0.1, 120);
+    camera.position.set(0, 1.65, 5.1);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, powerPreference: "high-performance" });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(mountEl.clientWidth, mountEl.clientHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    mountEl.appendChild(renderer.domElement);
+
+    const ship = createSpaceshipInterior();
+    scene.add(ship);
+    ship.visible = false;
+
+    const {
+      group: wallSymbolGroup,
+      symbols: floatingWallSymbols,
+      textures: floatingWallSymbolTextures,
+    } = createFloatingWallSymbols();
+    wallSymbolGroup.visible = false;
+    scene.add(wallSymbolGroup);
+
+    const introEarthGroup = new THREE.Group();
+    const introEarthCenter = new THREE.Vector3(0, 1.48, -3.7);
+    let introEarthModel: THREE.Object3D | null = null;
+    let introUfoModel: THREE.Object3D | null = null;
+    const earth = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(1.32, 1),
+      new THREE.MeshStandardMaterial({
+        color: "#3d434c",
+        roughness: 0.98,
+        metalness: 0,
+        emissive: "#040507",
+        emissiveIntensity: 0.07,
+      }),
+    );
+    earth.position.copy(introEarthCenter);
+    introEarthGroup.add(earth);
+
+    const cloudLayer = new THREE.Mesh(
+      new THREE.IcosahedronGeometry(1.37, 1),
+      new THREE.MeshStandardMaterial({
+        color: "#9ea6b2",
+        transparent: true,
+        opacity: 0.06,
+        roughness: 0.95,
+        metalness: 0,
+      }),
+    );
+    cloudLayer.position.copy(earth.position);
+    introEarthGroup.add(cloudLayer);
+
+    const starCount = 340;
+    const starPositions = new Float32Array(starCount * 3);
+    for (let i = 0; i < starCount; i++) {
+      const i3 = i * 3;
+      starPositions[i3] = (Math.random() - 0.5) * 30;
+      starPositions[i3 + 1] = -4 + Math.random() * 13;
+      starPositions[i3 + 2] = -7 - Math.random() * 10;
+    }
+    const starGeometry = new THREE.BufferGeometry();
+    starGeometry.setAttribute("position", new THREE.BufferAttribute(starPositions, 3));
+    const stars = new THREE.Points(
+      starGeometry,
+      new THREE.PointsMaterial({
+        color: "#c9cfdb",
+        size: 0.072,
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: 0.9,
+        depthWrite: false,
+        fog: false,
+      }),
+    );
+
+    scene.add(introEarthGroup);
+    scene.add(stars);
+
+    const ufoOrbitBaseOffset = new THREE.Vector3(2.15, 1.08, 0.15);
+    const ufoOrbitPivot = new THREE.Object3D();
+    ufoOrbitPivot.position.copy(introEarthCenter);
+    scene.add(ufoOrbitPivot);
+
+    const ufoAnchor = new THREE.Object3D();
+    ufoAnchor.position.copy(ufoOrbitBaseOffset);
+    ufoOrbitPivot.add(ufoAnchor);
+
+    const introUfoLoader = new GLTFLoader();
+    introUfoLoader.load(
+      "/models/ufo_low_poly.glb",
+      (gltf) => {
+        introUfoModel = gltf.scene;
+
+        const bounds = new THREE.Box3().setFromObject(introUfoModel);
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        bounds.getSize(size);
+        bounds.getCenter(center);
+
+        const longestAxis = Math.max(size.x, size.y, size.z, 0.0001);
+        const targetDiameter = 0.82;
+        const fitScale = targetDiameter / longestAxis;
+        introUfoModel.scale.setScalar(fitScale);
+
+        bounds.setFromObject(introUfoModel);
+        bounds.getCenter(center);
+        introUfoModel.position.set(-center.x, -center.y, -center.z);
+
+        introUfoModel.traverse((object) => {
+          const mesh = object as THREE.Mesh;
+          if (!mesh.isMesh) return;
+          mesh.castShadow = false;
+          mesh.receiveShadow = false;
+
+          const applyUfoTuning = (material: THREE.Material) => {
+            if (material instanceof THREE.MeshStandardMaterial || material instanceof THREE.MeshPhysicalMaterial) {
+              material.color = new THREE.Color("#c8ced8");
+              material.roughness = 0.36;
+              material.metalness = 0.62;
+              material.emissive = new THREE.Color("#2a2f38");
+              material.emissiveIntensity = 0.2;
+            }
+          };
+
+          if (Array.isArray(mesh.material)) {
+            mesh.material.forEach((material) => applyUfoTuning(material));
+          } else if (mesh.material) {
+            applyUfoTuning(mesh.material);
+          }
+        });
+
+        ufoAnchor.add(introUfoModel);
+      },
+      undefined,
+      () => {
+        introUfoModel = new THREE.Mesh(
+          new THREE.CylinderGeometry(0.2, 0.28, 0.09, 24),
+          new THREE.MeshStandardMaterial({
+            color: "#c8ced8",
+            roughness: 0.36,
+            metalness: 0.62,
+            emissive: "#2a2f38",
+            emissiveIntensity: 0.2,
+          }),
+        );
+        introUfoModel.scale.setScalar(1.3);
+        ufoAnchor.add(introUfoModel);
+      },
+    );
+
+    const introEarthLoader = new GLTFLoader();
+    const introEarthModelCandidates = ["/models/low_poly_earth.glb", "/models/earth.glb"];
+
+    const loadIntroEarthModel = (candidateIndex: number) => {
+      if (candidateIndex >= introEarthModelCandidates.length) {
+        introEarthModel = null;
+        return;
+      }
+
+      introEarthLoader.load(
+        introEarthModelCandidates[candidateIndex],
+        (gltf) => {
+        introEarthModel = gltf.scene;
+
+        const bounds = new THREE.Box3().setFromObject(introEarthModel);
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        bounds.getSize(size);
+        bounds.getCenter(center);
+
+        const longestAxis = Math.max(size.x, size.y, size.z, 0.0001);
+        const targetDiameter = 2.8;
+        const fitScale = targetDiameter / longestAxis;
+        introEarthModel.scale.setScalar(fitScale);
+
+        bounds.setFromObject(introEarthModel);
+        bounds.getCenter(center);
+
+        introEarthModel.position.set(-center.x + introEarthCenter.x, -center.y + introEarthCenter.y, -center.z + introEarthCenter.z);
+
+        introEarthModel.traverse((object) => {
+          const mesh = object as THREE.Mesh;
+          if (!mesh.isMesh) return;
+          mesh.castShadow = false;
+          mesh.receiveShadow = false;
+
+          const applyTuning = (material: THREE.Material) => {
+            if (material instanceof THREE.MeshStandardMaterial || material instanceof THREE.MeshPhysicalMaterial) {
+              const materialName = material.name.toLowerCase();
+
+              if (materialName.includes("water")) {
+                material.color = new THREE.Color("#34557e");
+                material.roughness = 0.95;
+                material.metalness = 0;
+              } else if (materialName.includes("earth")) {
+                material.color = new THREE.Color("#4f5542");
+                material.roughness = 0.99;
+                material.metalness = 0;
+              }
+
+              material.roughness = Math.min(1, Math.max(0, material.roughness ?? 0.8));
+              material.metalness = Math.min(1, Math.max(0, material.metalness ?? 0.05));
+              material.emissiveIntensity = 0;
+            }
+          };
+
+          if (Array.isArray(mesh.material)) {
+            mesh.material.forEach((material) => applyTuning(material));
+          } else if (mesh.material) {
+            applyTuning(mesh.material);
+          }
+        });
+
+          introEarthGroup.visible = false;
+          scene.add(introEarthModel);
+        },
+        undefined,
+        () => {
+          loadIntroEarthModel(candidateIndex + 1);
+        },
+      );
+    };
+
+    loadIntroEarthModel(0);
+
+    const introAmbient = new THREE.AmbientLight("#a5aebe", 0.11);
+    scene.add(introAmbient);
+
+    const introRim = new THREE.DirectionalLight("#c7ced9", 0.4);
+    introRim.position.set(3.1, 2.5, 2.1);
+    scene.add(introRim);
+
+    const introBack = new THREE.PointLight("#828a97", 0.13, 13.5, 2);
+    introBack.position.set(-2.6, 1.1, -6.8);
+    scene.add(introBack);
+
+    const introFill = new THREE.DirectionalLight("#afb7c4", 0.14);
+    introFill.position.set(-2.8, 1.8, 1.9);
+    scene.add(introFill);
+
+    const ufoGlow = new THREE.PointLight("#cfd6e4", 0.52, 4.8, 2);
+    scene.add(ufoGlow);
+
+    const endingExplosionFlash = new THREE.Mesh(
+      new THREE.SphereGeometry(0.65, 26, 26),
+      new THREE.MeshBasicMaterial({
+        color: "#fff3d0",
+        transparent: true,
+        opacity: 0,
+        depthWrite: false,
+        blending: THREE.AdditiveBlending,
+      }),
+    );
+    endingExplosionFlash.position.copy(introEarthCenter);
+    endingExplosionFlash.visible = false;
+    scene.add(endingExplosionFlash);
+
+    const endingExplosionLight = new THREE.PointLight("#ffd49a", 0, 8.5, 1.8);
+    endingExplosionLight.position.copy(introEarthCenter);
+    scene.add(endingExplosionLight);
+
+    const ambient = new THREE.AmbientLight("#233754", 0.08);
+    scene.add(ambient);
+
+    const dimRim = new THREE.PointLight("#536f96", 0.14, 9, 2);
+    dimRim.position.set(0, 3.8, -4.6);
+    scene.add(dimRim);
+
+    const ceilingGlowDisc = new THREE.Mesh(
+      new THREE.CircleGeometry(0.72, 40),
+      new THREE.MeshStandardMaterial({
+        color: "#5f4b20",
+        emissive: "#ffd46b",
+        emissiveIntensity: 2.4,
+        roughness: 0.2,
+        metalness: 0,
+      }),
+    );
+    ceilingGlowDisc.position.set(0, 4.28, 0);
+    ceilingGlowDisc.rotation.x = Math.PI / 2;
+    scene.add(ceilingGlowDisc);
+
+    const flashLight = new THREE.SpotLight("#c7c8cc", 8.2, 26, Math.PI * 0.125, 0.62, 1.22);
+    const flashLightTarget = new THREE.Object3D();
+    scene.add(flashLight);
+    scene.add(flashLightTarget);
+    flashLight.target = flashLightTarget;
+
+    const flashFill = new THREE.PointLight("#c9c7bf", 0.24, 4, 1.9);
+    scene.add(flashFill);
+
+    const baseAmbientIntensity = 0.08;
+    const baseDimRimIntensity = 0.14;
+    const baseFlashIntensity = 8.2;
+    const baseFlashFillIntensity = 0.24;
+    const baseCeilingEmissiveIntensity = 2.4;
+    const baseAmbientColor = new THREE.Color("#233754");
+    const baseDimRimColor = new THREE.Color("#536f96");
+    const baseFlashColor = new THREE.Color("#c7c8cc");
+    const baseFlashFillColor = new THREE.Color("#c9c7bf");
+    const baseCeilingEmissiveColor = new THREE.Color("#ffd46b");
+    const alertAmbientColor = new THREE.Color("#45141a");
+    const alertDimRimColor = new THREE.Color("#8f1f2b");
+    const alertFlashColor = new THREE.Color("#ff5d68");
+    const alertFlashFillColor = new THREE.Color("#d8444f");
+    const alertCeilingEmissiveColor = new THREE.Color("#ff2b3e");
+    const ceilingGlowMaterial = ceilingGlowDisc.material as THREE.MeshStandardMaterial;
+    let roomFlickerPulse = 1;
+    let roomFlickerPulseTime = 0;
+    let roomFlickerTimer = 0;
+    let finalQuestionDimLevel = 0;
+    let wallSymbolVisibility = 0;
+
+    ambient.visible = false;
+    dimRim.visible = false;
+    ceilingGlowDisc.visible = false;
+    flashLight.visible = false;
+    flashFill.visible = false;
+
+    let alienRoot: THREE.Object3D | null = null;
+    const alienCollisionCenter = new THREE.Vector3(0, 0, 0);
+    const alienLimbTimeUniforms: Array<{ value: number }> = [];
+    const alienHeadNoUniforms: Array<{ value: number }> = [];
+    const alienHeadYesUniforms: Array<{ value: number }> = [];
+    const alienArmTalkUniforms: Array<{ value: number }> = [];
+    const alienHeadTalkUniforms: Array<{ value: number }> = [];
+    let armTalkLevel = 0;
+    const loader = new GLTFLoader();
+    loader.load(
+      "/models/alien.glb",
+      (gltf) => {
+        alienRoot = gltf.scene;
+
+        const bounds = new THREE.Box3().setFromObject(alienRoot);
+        const size = new THREE.Vector3();
+        const center = new THREE.Vector3();
+        bounds.getSize(size);
+        bounds.getCenter(center);
+
+        if (size.y > 0) {
+          const targetHeight = 2.25;
+          const fitScale = targetHeight / size.y;
+          alienRoot.scale.setScalar(fitScale);
+
+          bounds.setFromObject(alienRoot);
+          bounds.getCenter(center);
+          const minY = bounds.min.y;
+
+          const platformTopY = 0.28;
+          alienRoot.position.set(-center.x, platformTopY - minY, -center.z);
+          alienCollisionCenter.set(alienRoot.position.x, 0, alienRoot.position.z);
+        } else {
+          alienRoot.position.set(0, 0.3, 0);
+          alienCollisionCenter.set(alienRoot.position.x, 0, alienRoot.position.z);
+        }
+
+        enableProceduralLimbMotion(
+          alienRoot,
+          alienLimbTimeUniforms,
+          alienHeadNoUniforms,
+          alienHeadYesUniforms,
+          alienArmTalkUniforms,
+          alienHeadTalkUniforms,
+        );
+        scene.add(alienRoot);
+      },
+      undefined,
+      () => {
+        const fallback = new THREE.Mesh(
+          new THREE.SphereGeometry(0.8, 24, 20),
+          new THREE.MeshStandardMaterial({ color: "#6ee9b8", roughness: 0.5, metalness: 0.1 }),
+        );
+        fallback.position.set(0, 1.2, 0);
+        alienRoot = fallback;
+        alienCollisionCenter.set(fallback.position.x, 0, fallback.position.z);
+        scene.add(fallback);
+      },
+    );
+
+    const keys = new Set<string>();
+    let isDragging = false;
+    let yaw = 0;
+    let pitch = -0.03;
+
+    const playerPosition = new THREE.Vector3(0, 1.65, 5.1);
+    const forwardDir = new THREE.Vector3();
+    const rightDir = new THREE.Vector3();
+    const movement = new THREE.Vector3();
+    const desiredVelocity = new THREE.Vector3();
+    const currentVelocity = new THREE.Vector3();
+    const lookDir = new THREE.Vector3();
+    const walkSpeed = 2.1;
+    const acceleration = 6.5;
+    const deceleration = 8.5;
+    const playerRadius = 0.24;
+    const roomWalkBoundaryRadius = 4.78;
+    const alienCollisionRadius = 0.95;
+    const tmpEuler = new THREE.Euler(0, 0, 0, "YXZ");
+    const eyeHeight = 1.65;
+    let bobTime = 0;
+    let bobOffset = 0;
+    let bobIntensity = 0;
+    let lastFootstepIndex = -1;
+
+    camera.position.copy(playerPosition);
+    tmpEuler.set(pitch, yaw, 0);
+    camera.quaternion.setFromEuler(tmpEuler);
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (phaseRef.current === "intro") return;
+      keys.add(event.key.toLowerCase());
+    };
+
+    const onKeyUp = (event: KeyboardEvent) => {
+      keys.delete(event.key.toLowerCase());
+    };
+
+    const onMouseDown = (event: MouseEvent) => {
+      if (phaseRef.current === "intro") return;
+      if (event.button !== 0) return;
+      isDragging = true;
+      mountEl.classList.add("is-dragging");
+    };
+
+    const onMouseUp = () => {
+      isDragging = false;
+      mountEl.classList.remove("is-dragging");
+    };
+
+    const onMouseMove = (event: MouseEvent) => {
+      if (phaseRef.current === "intro") return;
+      if (!isDragging) return;
+      yaw -= event.movementX * 0.003;
+      pitch -= event.movementY * 0.0022;
+      pitch = Math.max(-Math.PI / 2.25, Math.min(Math.PI / 2.25, pitch));
+    };
+
+    const onResize = () => {
+      const { clientWidth, clientHeight } = mountEl;
+      camera.aspect = clientWidth / clientHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(clientWidth, clientHeight);
+    };
+
+    window.addEventListener("resize", onResize);
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    mountEl.addEventListener("mousedown", onMouseDown);
+    window.addEventListener("mouseup", onMouseUp);
+    window.addEventListener("mousemove", onMouseMove);
+
+    const clock = new THREE.Clock();
+    const introCameraPosition = new THREE.Vector3(0, 1.74, 4.72);
+    const introLookTarget = new THREE.Vector3(0, 1.47, -3.7);
+    const ufoWorldPosition = new THREE.Vector3();
+    let buildupActive = false;
+    let animationFrameId = 0;
+
+    const animate = () => {
+      const delta = Math.min(clock.getDelta(), 0.06);
+      const elapsed = clock.getElapsedTime();
+      const introMode = phaseRef.current === "intro";
+
+      if (isRevealingRef.current) {
+        const nextProgress = Math.min(1, revealProgressRef.current + delta / 3.1);
+        if (nextProgress !== revealProgressRef.current) {
+          revealProgressRef.current = nextProgress;
+          setRevealProgress(nextProgress);
+        }
+
+        if (nextProgress >= 1) {
+          isRevealingRef.current = false;
+          setIsRevealing(false);
+        }
+      }
+
+      if (introMode) {
+        ship.visible = false;
+        introEarthGroup.visible = !introEarthModel;
+        if (introEarthModel) introEarthModel.visible = true;
+        introAmbient.visible = true;
+        introRim.visible = true;
+        introBack.visible = true;
+        introFill.visible = true;
+        ufoGlow.visible = true;
+        stars.visible = true;
+        ufoOrbitPivot.visible = true;
+
+        ambient.visible = false;
+        dimRim.visible = false;
+        ceilingGlowDisc.visible = false;
+        flashLight.visible = false;
+        flashFill.visible = false;
+        wallSymbolGroup.visible = false;
+        if (alienRoot) alienRoot.visible = false;
+
+        scene.background = introBackgroundColor;
+        scene.fog = introFog;
+
+        ambient.intensity = baseAmbientIntensity;
+        dimRim.intensity = baseDimRimIntensity;
+        flashLight.intensity = baseFlashIntensity;
+        flashFill.intensity = baseFlashFillIntensity;
+        ceilingGlowMaterial.emissiveIntensity = baseCeilingEmissiveIntensity;
+        ambient.color.copy(baseAmbientColor);
+        dimRim.color.copy(baseDimRimColor);
+        flashLight.color.copy(baseFlashColor);
+        flashFill.color.copy(baseFlashFillColor);
+        ceilingGlowMaterial.emissive.copy(baseCeilingEmissiveColor);
+        endingExplosionFlash.visible = false;
+        endingExplosionLight.intensity = 0;
+        roomFlickerPulse = 1;
+        roomFlickerPulseTime = 0;
+        roomFlickerTimer = 0;
+        finalQuestionDimLevel = 0;
+
+        if (introEarthModel) {
+          introEarthModel.rotation.y += delta * 0.045;
+          introEarthModel.rotation.x = Math.sin(elapsed * 0.3) * 0.02;
+        } else {
+          earth.rotation.y += delta * 0.045;
+          earth.rotation.x = Math.sin(elapsed * 0.37) * 0.035;
+          cloudLayer.rotation.y += delta * 0.055;
+          cloudLayer.rotation.x = Math.sin(elapsed * 0.42) * 0.018;
+        }
+
+        const ufoBobOffset = Math.sin(elapsed * 1.15) * 0.08;
+        ufoOrbitPivot.rotation.y += delta * 0.045;
+        ufoAnchor.position.set(ufoOrbitBaseOffset.x, ufoOrbitBaseOffset.y + ufoBobOffset, ufoOrbitBaseOffset.z);
+        ufoAnchor.lookAt(0, 0, 0);
+        ufoAnchor.getWorldPosition(ufoWorldPosition);
+        ufoGlow.position.copy(ufoWorldPosition);
+
+        isDragging = false;
+        mountEl.classList.remove("is-dragging");
+        currentVelocity.set(0, 0, 0);
+        camera.position.copy(introCameraPosition);
+        if (Math.abs(camera.fov - 65) > 0.01) {
+          camera.fov = THREE.MathUtils.lerp(camera.fov, 65, 0.22);
+          camera.updateProjectionMatrix();
+        }
+        camera.lookAt(introLookTarget);
+
+        renderer.render(scene, camera);
+        animationFrameId = requestAnimationFrame(animate);
+        return;
+      }
+
+      const endingMode = phaseRef.current === "ending";
+      const endingSequence = endingCinematicRef.current;
+      const endingSavedOutcome = endingSavedOutcomeRef.current;
+      const endingStage = endingSequence.stage;
+      const shouldBuildupBeActive =
+        endingMode && (endingStage === "room-shake-flash" || endingStage === "fade-room-black");
+
+      if (shouldBuildupBeActive !== buildupActive) {
+        buildupActive = shouldBuildupBeActive;
+        const buildup = buildupAudioRef.current;
+        if (buildup) {
+          if (shouldBuildupBeActive) {
+            try {
+              buildup.currentTime = BUILDUP_TRIM_OFFSET_SECONDS;
+            } catch {
+              buildup.currentTime = 0;
+            }
+            const playAttempt = buildup.play();
+            if (playAttempt && typeof playAttempt.then === "function") {
+              void playAttempt
+                .then(() => {
+                  fadeBuildupTo(1, 1800);
+                })
+                .catch(() => {
+                  return;
+                });
+            } else {
+              fadeBuildupTo(1, 1800);
+            }
+          } else {
+            fadeBuildupTo(0, 650);
+          }
+        }
+      }
+      const isEndingRoomStage = endingMode && (endingStage === "room-shake-flash" || endingStage === "fade-room-black");
+      const isEndingWorldStage =
+        endingMode &&
+        (endingStage === "show-saved" ||
+          endingStage === "show-destroyed-earth" ||
+          endingStage === "show-destroyed-engulf" ||
+          endingStage === "destroyed-fade-black" ||
+          endingStage === "complete");
+      const isEndingDestroyedWorld =
+        endingMode &&
+        (endingStage === "show-destroyed-earth" ||
+          endingStage === "show-destroyed-engulf" ||
+          endingStage === "destroyed-fade-black");
+
+      if (endingMode) {
+        const now = performance.now();
+        let nextBlackout = endingBlackoutOpacityRef.current;
+        let nextFlash = endingFlashOpacityRef.current;
+        const stageElapsed = (now - endingSequence.stageStartedAt) / 1000;
+
+        if (endingStage === "room-shake-flash") {
+          nextBlackout = Math.max(0, nextBlackout - delta / 0.45);
+          nextFlash = 0;
+
+          if (stageElapsed >= 2.0) {
+            endingSequence.stage = "fade-room-black";
+            endingSequence.stageStartedAt = now;
+          }
+        } else if (endingStage === "fade-room-black") {
+          nextFlash = 0;
+          nextBlackout = Math.min(1, nextBlackout + delta / 1.45);
+          if (nextBlackout >= 0.995) {
+            endingSequence.stage = endingSavedOutcome ? "show-saved" : "show-destroyed-earth";
+            endingSequence.stageStartedAt = now;
+            endingSequence.blastStartedAt = 0;
+            endingSequence.lastRumbleAt = 0;
+          }
+        } else if (endingStage === "show-saved") {
+          nextBlackout = Math.max(0, nextBlackout - delta / 1.35);
+          nextFlash = Math.max(0, nextFlash - delta / 0.5);
+          if (stageElapsed >= 2.8 && !endingPanelVisibleRef.current) {
+            endingPanelVisibleRef.current = true;
+            setEndingPanelVisible(true);
+            endingSequence.stage = "complete";
+            endingSequence.stageStartedAt = now;
+          }
+        } else if (endingStage === "show-destroyed-earth") {
+          nextBlackout = Math.max(0, nextBlackout - delta / 1.15);
+          nextFlash = Math.max(0, nextFlash - delta / 0.35);
+
+          if (stageElapsed >= 1.0 && endingSequence.blastStartedAt <= 0) {
+            endingSequence.blastStartedAt = now;
+            endingSequence.lastRumbleAt = now;
+            playEndingRumbleOneShot();
+            playDistantExplosionOneShot();
+            endingSequence.stage = "show-destroyed-engulf";
+            endingSequence.stageStartedAt = now;
+          }
+        } else if (endingStage === "show-destroyed-engulf") {
+          nextBlackout = Math.max(0, nextBlackout - delta / 0.55);
+          nextFlash = Math.min(1, nextFlash + delta / 0.34);
+
+          if (endingSequence.blastStartedAt > 0) {
+            const sinceBlast = now - endingSequence.blastStartedAt;
+            if (sinceBlast - endingSequence.lastRumbleAt >= 340) {
+              endingSequence.lastRumbleAt = now;
+              playEndingRumbleOneShot();
+            }
+
+            if (sinceBlast >= 1000) {
+              endingSequence.stage = "destroyed-fade-black";
+              endingSequence.stageStartedAt = now;
+            }
+          }
+        } else if (endingStage === "destroyed-fade-black") {
+          nextFlash = Math.max(0, nextFlash - delta / 1.15);
+          nextBlackout = Math.min(1, nextBlackout + delta / 0.92);
+          if (nextBlackout >= 0.995 && !endingPanelVisibleRef.current) {
+            endingPanelVisibleRef.current = true;
+            setEndingPanelVisible(true);
+            endingSequence.stage = "complete";
+            endingSequence.stageStartedAt = now;
+          }
+        } else if (endingStage === "complete") {
+          nextFlash = Math.max(0, nextFlash - delta / 0.45);
+        }
+
+        if (Math.abs(nextBlackout - endingBlackoutOpacityRef.current) > 0.0015) {
+          endingBlackoutOpacityRef.current = nextBlackout;
+          setEndingBlackoutOpacity(nextBlackout);
+        }
+
+        if (Math.abs(nextFlash - endingFlashOpacityRef.current) > 0.0015) {
+          endingFlashOpacityRef.current = nextFlash;
+          setEndingFlashOpacity(nextFlash);
+        }
+      }
+
+      if (isEndingWorldStage) {
+        ship.visible = false;
+        introEarthGroup.visible = !introEarthModel;
+        if (introEarthModel) introEarthModel.visible = true;
+        introAmbient.visible = true;
+        introRim.visible = true;
+        introBack.visible = true;
+        introFill.visible = true;
+        ufoGlow.visible = false;
+        stars.visible = true;
+        ufoOrbitPivot.visible = false;
+
+        ambient.visible = false;
+        dimRim.visible = false;
+        ceilingGlowDisc.visible = false;
+        flashLight.visible = false;
+        flashFill.visible = false;
+        wallSymbolGroup.visible = false;
+        if (alienRoot) alienRoot.visible = false;
+
+        scene.background = introBackgroundColor;
+        scene.fog = introFog;
+
+        const worldBob = Math.sin(elapsed * 0.36);
+        const earthShakeAmount =
+          endingStage === "show-destroyed-earth"
+            ? 0.055 + (Math.sin(elapsed * 33.0) * 0.5 + 0.5) * 0.02
+            : endingStage === "show-destroyed-engulf"
+              ? 0.072
+              : 0;
+        if (introEarthModel) {
+          introEarthModel.rotation.y += delta * 0.052;
+          introEarthModel.rotation.x = worldBob * 0.023 + Math.sin(elapsed * 26.0) * earthShakeAmount;
+          introEarthModel.rotation.z = Math.sin(elapsed * 31.0) * earthShakeAmount * 0.82;
+        } else {
+          earth.visible = true;
+          cloudLayer.visible = true;
+          earth.rotation.y += delta * 0.048;
+          earth.rotation.x = worldBob * 0.03 + Math.sin(elapsed * 26.0) * earthShakeAmount;
+          earth.rotation.z = Math.sin(elapsed * 31.0) * earthShakeAmount * 0.82;
+          cloudLayer.rotation.y += delta * 0.057;
+          cloudLayer.rotation.x = Math.sin(elapsed * 0.42) * 0.018;
+        }
+
+        const worldUfoBob = Math.sin(elapsed * 0.98) * 0.07;
+        ufoOrbitPivot.rotation.y += delta * 0.038;
+        ufoAnchor.position.set(ufoOrbitBaseOffset.x, ufoOrbitBaseOffset.y + worldUfoBob, ufoOrbitBaseOffset.z);
+        ufoAnchor.lookAt(0, 0, 0);
+        ufoAnchor.getWorldPosition(ufoWorldPosition);
+        ufoGlow.position.copy(ufoWorldPosition);
+      } else {
+        ship.visible = true;
+        introEarthGroup.visible = false;
+        if (introEarthModel) introEarthModel.visible = false;
+        introAmbient.visible = false;
+        introRim.visible = false;
+        introBack.visible = false;
+        introFill.visible = false;
+        ufoGlow.visible = false;
+        stars.visible = false;
+        ufoOrbitPivot.visible = false;
+
+        ambient.visible = true;
+        dimRim.visible = true;
+        ceilingGlowDisc.visible = true;
+        flashLight.visible = true;
+        flashFill.visible = true;
+        wallSymbolGroup.visible = wallSymbolVisibility > 0.01;
+        if (alienRoot) alienRoot.visible = true;
+
+        scene.background = gameplayBackgroundColor;
+        scene.fog = gameplayFog;
+      }
+
+      roomFlickerTimer -= delta;
+      roomFlickerPulseTime = Math.max(0, roomFlickerPulseTime - delta);
+
+      if (roomFlickerTimer <= 0) {
+        roomFlickerPulse = 0.78 + Math.random() * 0.14;
+        roomFlickerPulseTime = 0.022 + Math.random() * 0.035;
+        roomFlickerTimer = 1.2 + Math.random() * 2.6;
+        playFlickerZapOneShot();
+      }
+
+      const roomLightFactor = roomFlickerPulseTime > 0 ? roomFlickerPulse : 1;
+      const ceilingFlickerFactor = roomFlickerPulseTime > 0 ? THREE.MathUtils.clamp(roomFlickerPulse * 0.42, 0.24, 0.42) : 1;
+
+      const isFinalQuestionActive = phaseRef.current === "questions" && turnIndexRef.current === QUESTION_CONTENT.length - 1;
+      const isGeometricSymbolsQuestionActive =
+        phaseRef.current === "questions" &&
+        turnIndexRef.current === GEOMETRIC_SYMBOLS_TURN_INDEX &&
+        !isRevealingRef.current;
+      const wallSymbolTargetVisibility = isGeometricSymbolsQuestionActive ? 1 : 0;
+      const wallSymbolFadeRate = wallSymbolTargetVisibility > wallSymbolVisibility ? 1.15 : 1.9;
+      const wallSymbolFadeLerp = 1 - Math.exp(-delta * wallSymbolFadeRate);
+      wallSymbolVisibility = THREE.MathUtils.lerp(wallSymbolVisibility, wallSymbolTargetVisibility, wallSymbolFadeLerp);
+      wallSymbolGroup.visible = wallSymbolVisibility > 0.01;
+      const wallSymbolFadeInShakeAmount =
+        wallSymbolTargetVisibility > 0 && wallSymbolVisibility < 0.995 ? (1 - wallSymbolVisibility) * 0.06 : 0;
+      const questionLength = Math.max(currentQuestionCharsRef.current, 1);
+      const typedProgress = THREE.MathUtils.clamp(typedQuestionCharsRef.current / questionLength, 0, 1);
+      const isSpeechLayerPlaying = speechAudioLayersRef.current.some(
+        (layer) => !layer.audio.paused && !layer.audio.ended,
+      );
+      const isSynthSpeaking = speechSupported && window.speechSynthesis.speaking;
+      const isTtsActive = isSpeechLayerPlaying || isSynthSpeaking;
+      const isAlienTalking =
+        phaseRef.current === "questions" &&
+        !isRevealingRef.current &&
+        ((currentQuestionCharsRef.current > 0 &&
+          typedQuestionCharsRef.current > 0 &&
+          typedQuestionCharsRef.current < currentQuestionCharsRef.current) ||
+          isTtsActive);
+      const talkTarget = isAlienTalking ? 1 : 0;
+      const talkRate = talkTarget > armTalkLevel ? 3.2 : 1.6;
+      const talkLerp = 1 - Math.exp(-delta * talkRate);
+      armTalkLevel = THREE.MathUtils.lerp(armTalkLevel, talkTarget, talkLerp);
+      const delayedFadeProgress = THREE.MathUtils.clamp((typedProgress - 0.72) / 0.28, 0, 1);
+      const dimTarget = isEndingRoomStage ? 1 : isFinalQuestionActive ? delayedFadeProgress : 0;
+      const dimLerp = 1 - Math.exp(-delta * (isFinalQuestionActive || isEndingRoomStage ? 1.1 : 3.4));
+      finalQuestionDimLevel = THREE.MathUtils.lerp(finalQuestionDimLevel, dimTarget, dimLerp);
+      const finalQuestionLightFactor = 1 - finalQuestionDimLevel * 0.52;
+
+      ambient.intensity = baseAmbientIntensity * roomLightFactor * finalQuestionLightFactor;
+      dimRim.intensity = baseDimRimIntensity * roomLightFactor * finalQuestionLightFactor;
+      flashLight.intensity = baseFlashIntensity * roomLightFactor * finalQuestionLightFactor;
+      flashFill.intensity = baseFlashFillIntensity * roomLightFactor * finalQuestionLightFactor;
+      ceilingGlowMaterial.emissiveIntensity =
+        baseCeilingEmissiveIntensity * ceilingFlickerFactor * (1 - finalQuestionDimLevel * 0.66);
+
+      ambient.color.copy(baseAmbientColor).lerp(alertAmbientColor, finalQuestionDimLevel);
+      dimRim.color.copy(baseDimRimColor).lerp(alertDimRimColor, finalQuestionDimLevel);
+      flashLight.color.copy(baseFlashColor).lerp(alertFlashColor, finalQuestionDimLevel);
+      flashFill.color.copy(baseFlashFillColor).lerp(alertFlashFillColor, finalQuestionDimLevel);
+      ceilingGlowMaterial.emissive.copy(baseCeilingEmissiveColor).lerp(alertCeilingEmissiveColor, finalQuestionDimLevel);
+
+      if (isEndingWorldStage) {
+        endingExplosionFlash.visible = false;
+        endingExplosionLight.intensity = 0;
+      }
+
+      if (endingStage === "show-destroyed-earth") {
+        endingExplosionLight.intensity = 2.3 + (Math.sin(elapsed * 14.0) * 0.5 + 0.5) * 2.2;
+      }
+
+      if ((endingStage === "show-destroyed-engulf" || endingStage === "destroyed-fade-black") && endingSequence.blastStartedAt > 0) {
+        const sinceBlastMs = performance.now() - endingSequence.blastStartedAt;
+        const explosionSeconds = sinceBlastMs / 1000;
+        const blastPeak = THREE.MathUtils.clamp(explosionSeconds / 0.34, 0, 1);
+        const blastDecay = THREE.MathUtils.clamp((explosionSeconds - 0.34) / 1.45, 0, 1);
+        const blastEnvelope = blastPeak * (1 - blastDecay * 0.92);
+
+        endingExplosionFlash.visible = blastEnvelope > 0.01;
+        endingExplosionFlash.scale.setScalar(1 + explosionSeconds * 5.2);
+        const flashMaterial = endingExplosionFlash.material as THREE.MeshBasicMaterial;
+        flashMaterial.opacity = THREE.MathUtils.clamp(blastEnvelope * 0.92, 0, 0.92);
+        endingExplosionLight.intensity = 2.4 + blastEnvelope * 12.5;
+
+        const earthVisibility = explosionSeconds < 1.0;
+        if (introEarthModel) {
+          introEarthModel.visible = earthVisibility;
+        } else {
+          earth.visible = earthVisibility;
+          cloudLayer.visible = earthVisibility;
+        }
+      }
+
+      if (!isEndingDestroyedWorld && endingSequence.blastStartedAt > 0) {
+        endingSequence.blastStartedAt = 0;
+      }
+
+      movement.set(0, 0, 0);
+
+      forwardDir.set(Math.sin(yaw), 0, Math.cos(yaw));
+      rightDir.set(Math.cos(yaw), 0, -Math.sin(yaw));
+
+      const allowMovement = phaseRef.current === "questions";
+      if (allowMovement && keys.has("w")) movement.addScaledVector(forwardDir, -1);
+      if (allowMovement && keys.has("s")) movement.addScaledVector(forwardDir, 1);
+      if (allowMovement && keys.has("a")) movement.addScaledVector(rightDir, -1);
+      if (allowMovement && keys.has("d")) movement.addScaledVector(rightDir, 1);
+
+      const hasInput = movement.lengthSq() > 0;
+      if (hasInput) {
+        desiredVelocity.copy(movement.normalize()).multiplyScalar(walkSpeed);
+      } else {
+        desiredVelocity.set(0, 0, 0);
+      }
+
+      const velocityLerp = 1 - Math.exp(-delta * (hasInput ? acceleration : deceleration));
+      currentVelocity.lerp(desiredVelocity, velocityLerp);
+      playerPosition.addScaledVector(currentVelocity, delta);
+
+      const speedRatio = THREE.MathUtils.clamp(currentVelocity.length() / walkSpeed, 0, 1);
+      const isMoving = speedRatio > 0.05;
+
+      if (alienRoot) {
+        const alienDx = playerPosition.x - alienCollisionCenter.x;
+        const alienDz = playerPosition.z - alienCollisionCenter.z;
+        const minAlienDistance = alienCollisionRadius + playerRadius;
+        const alienDistance = Math.hypot(alienDx, alienDz);
+
+        if (alienDistance < minAlienDistance) {
+          const safeDistance = Math.max(alienDistance, 0.0001);
+          const pushScale = minAlienDistance / safeDistance;
+          playerPosition.x = alienCollisionCenter.x + alienDx * pushScale;
+          playerPosition.z = alienCollisionCenter.z + alienDz * pushScale;
+        }
+      }
+
+      const planarLength = Math.hypot(playerPosition.x, playerPosition.z);
+      if (planarLength > roomWalkBoundaryRadius) {
+        const scale = roomWalkBoundaryRadius / planarLength;
+        playerPosition.x *= scale;
+        playerPosition.z *= scale;
+      }
+
+      const bobIntensityTarget = isMoving ? speedRatio : 0;
+      const bobIntensityLerp = 1 - Math.exp(-delta * (isMoving ? 8.5 : 2.1));
+      bobIntensity = THREE.MathUtils.lerp(bobIntensity, bobIntensityTarget, bobIntensityLerp);
+
+      bobTime += delta * (1.95 + bobIntensity * 2.2);
+      const stomp = -Math.pow(Math.abs(Math.sin(bobTime)), 1.45);
+      const bobAmplitude = (0.034 + bobIntensity * 0.056) * bobIntensity;
+      bobOffset = stomp * bobAmplitude;
+
+      if (isMoving && phaseRef.current === "questions") {
+        const footstepIndex = Math.floor((bobTime + Math.PI * 0.5) / Math.PI);
+        if (lastFootstepIndex === -1) {
+          lastFootstepIndex = footstepIndex;
+        } else if (footstepIndex !== lastFootstepIndex) {
+          lastFootstepIndex = footstepIndex;
+          playFootstepOneShot();
+        }
+      } else {
+        lastFootstepIndex = -1;
+      }
+
+      let shakePosX = 0;
+      let shakePosY = 0;
+      let shakePosZ = 0;
+      let shakeYaw = 0;
+      let shakePitch = 0;
+
+      if (isRevealingRef.current) {
+        const shakeEnvelope = Math.max(0, 1 - revealProgressRef.current);
+        const baseShake = 0.07 * shakeEnvelope;
+
+        shakePosX += Math.sin(elapsed * 34.0) * baseShake * 0.5;
+        shakePosY += Math.sin(elapsed * 49.0) * baseShake * 0.3;
+        shakePosZ += Math.sin(elapsed * 29.0) * baseShake * 0.4;
+        shakeYaw += Math.sin(elapsed * 37.0) * baseShake * 0.1;
+        shakePitch += Math.sin(elapsed * 41.0) * baseShake * 0.075;
+      }
+
+      if (endingStage === "room-shake-flash" || endingStage === "fade-room-black") {
+        const endingShake = 0.11;
+        shakePosX += Math.sin(elapsed * 26.4) * endingShake * 0.54;
+        shakePosY += Math.sin(elapsed * 33.7) * endingShake * 0.32;
+        shakePosZ += Math.sin(elapsed * 29.8) * endingShake * 0.44;
+        shakeYaw += Math.sin(elapsed * 31.2) * endingShake * 0.14;
+        shakePitch += Math.sin(elapsed * 36.1) * endingShake * 0.11;
+
+        const flashBeat = Math.sin(elapsed * 19.5) * 0.5 + 0.5;
+        const redWhiteMix = flashBeat;
+        ambient.color.copy(alertAmbientColor).lerp(baseAmbientColor, redWhiteMix);
+        dimRim.color.copy(alertDimRimColor).lerp(baseDimRimColor, redWhiteMix);
+        flashLight.color.copy(alertFlashColor).lerp(baseFlashColor, redWhiteMix);
+        flashFill.color.copy(alertFlashFillColor).lerp(baseFlashFillColor, redWhiteMix);
+        ceilingGlowMaterial.emissive.copy(alertCeilingEmissiveColor).lerp(baseCeilingEmissiveColor, redWhiteMix);
+      }
+
+      const stunNow = performance.now();
+      if (stunNow < stunEndsAtRef.current) {
+        const stunDurationMs = Math.max(1, stunEndsAtRef.current - stunStartedAtRef.current);
+        const stunProgress = THREE.MathUtils.clamp((stunNow - stunStartedAtRef.current) / stunDurationMs, 0, 1);
+        const stunEnvelope = Math.sin(stunProgress * Math.PI);
+        const stunIntensity = stunIntensityRef.current;
+
+        shakePosX += Math.sin(elapsed * 24.5) * 0.0247 * stunEnvelope * stunIntensity;
+        shakePosY += Math.sin(elapsed * 31.4) * 0.0143 * stunEnvelope * stunIntensity;
+        shakePosZ += Math.sin(elapsed * 27.8) * 0.01625 * stunEnvelope * stunIntensity;
+        shakeYaw += Math.sin(elapsed * 28.6) * 0.0377 * stunEnvelope * stunIntensity;
+        shakePitch += Math.sin(elapsed * 33.7) * 0.026 * stunEnvelope * stunIntensity;
+
+        const targetFov =
+          65 + stunEnvelope * 4.2 * stunIntensity + Math.sin(elapsed * 10.2) * 0.9 * stunEnvelope * stunIntensity;
+        camera.fov = THREE.MathUtils.lerp(camera.fov, targetFov, 0.34);
+        camera.updateProjectionMatrix();
+      } else if (Math.abs(camera.fov - 65) > 0.01) {
+        camera.fov = THREE.MathUtils.lerp(camera.fov, 65, 0.18);
+        camera.updateProjectionMatrix();
+      }
+
+      if (isEndingDestroyedWorld && endingSequence.blastStartedAt > 0) {
+        const blastSeconds = (performance.now() - endingSequence.blastStartedAt) / 1000;
+        const shakeEnvelope = THREE.MathUtils.clamp(1 - blastSeconds / 2.5, 0, 1);
+        shakePosX += Math.sin(elapsed * 42.3) * 0.11 * shakeEnvelope;
+        shakePosY += Math.sin(elapsed * 56.8) * 0.07 * shakeEnvelope;
+        shakePosZ += Math.sin(elapsed * 48.7) * 0.09 * shakeEnvelope;
+        shakeYaw += Math.sin(elapsed * 39.4) * 0.16 * shakeEnvelope;
+        shakePitch += Math.sin(elapsed * 45.2) * 0.12 * shakeEnvelope;
+
+        const targetFov = 65 + 9 * shakeEnvelope;
+        camera.fov = THREE.MathUtils.lerp(camera.fov, targetFov, 0.23);
+        camera.updateProjectionMatrix();
+      }
+
+      if (isEndingWorldStage) {
+        currentVelocity.set(0, 0, 0);
+        camera.position.set(
+          introCameraPosition.x + shakePosX,
+          introCameraPosition.y + shakePosY,
+          introCameraPosition.z + shakePosZ,
+        );
+        camera.lookAt(introLookTarget);
+      } else {
+        camera.position.set(playerPosition.x + shakePosX, eyeHeight + bobOffset + shakePosY, playerPosition.z + shakePosZ);
+        tmpEuler.set(pitch + shakePitch, yaw + shakeYaw, 0);
+        camera.quaternion.setFromEuler(tmpEuler);
+      }
+
+      camera.getWorldDirection(lookDir);
+      flashLight.position.copy(camera.position);
+      flashLightTarget.position.copy(camera.position).addScaledVector(lookDir, 6.2);
+      flashFill.position.copy(camera.position).addScaledVector(lookDir, 0.65);
+
+      if (alienRoot) {
+        for (const uniform of alienLimbTimeUniforms) {
+          uniform.value = elapsed;
+        }
+
+        const joltNow = performance.now();
+        const reactionDurationMs = Math.max(1, headJoltEndsAtRef.current - headReactionStartedAtRef.current);
+        const reactionProgress = THREE.MathUtils.clamp((joltNow - headReactionStartedAtRef.current) / reactionDurationMs, 0, 1);
+        const reactionEnvelope = joltNow < headJoltEndsAtRef.current ? Math.sin(reactionProgress * Math.PI) : 0;
+        const isHeadReactionActive =
+          reactionEnvelope > 0 && (headReactionModeRef.current === "no" || headReactionModeRef.current === "yes");
+
+        for (const uniform of alienArmTalkUniforms) {
+          uniform.value = armTalkLevel;
+        }
+
+        for (const uniform of alienHeadTalkUniforms) {
+          uniform.value = isHeadReactionActive ? 0 : armTalkLevel;
+        }
+
+        const headNoAngle =
+          headReactionModeRef.current === "no"
+            ? headJoltDirectionRef.current * Math.sin(reactionProgress * Math.PI * 4.2) * 0.34 * reactionEnvelope
+            : 0;
+        const headYesAngle =
+          headReactionModeRef.current === "yes"
+            ? Math.sin(reactionProgress * Math.PI * 2.4) * 0.45 * reactionEnvelope
+            : 0;
+
+        for (const uniform of alienHeadNoUniforms) {
+          uniform.value = headNoAngle;
+        }
+
+        for (const uniform of alienHeadYesUniforms) {
+          uniform.value = headYesAngle;
+        }
+
+        alienRoot.lookAt(camera.position.x, alienRoot.position.y, camera.position.z);
+      }
+
+      for (const symbol of floatingWallSymbols) {
+        const floatPhase = elapsed * symbol.driftSpeed + symbol.phase;
+        const angleDrift = Math.sin(floatPhase * 0.65) * 0.04;
+        const pulse = 0.2 + (Math.sin(elapsed * symbol.twinkleSpeed + symbol.phase) * 0.5 + 0.5) * 0.42;
+        const shakeX =
+          Math.sin(elapsed * (25 + symbol.twinkleSpeed * 2.8) + symbol.phase * 1.3) * wallSymbolFadeInShakeAmount;
+        const shakeY =
+          Math.cos(elapsed * (31 + symbol.driftSpeed * 3.2) + symbol.phase * 1.9) * wallSymbolFadeInShakeAmount * 0.52;
+        const shakeZ =
+          Math.sin(elapsed * (28 + symbol.twinkleSpeed * 2.1) + symbol.phase * 1.7) * wallSymbolFadeInShakeAmount;
+        symbol.sprite.position.x = Math.cos(symbol.angle + angleDrift) * symbol.radial + shakeX;
+        symbol.sprite.position.z = Math.sin(symbol.angle + angleDrift) * symbol.radial + shakeZ;
+        symbol.sprite.position.y = symbol.baseY + Math.sin(floatPhase) * 0.14 + shakeY;
+
+        const symbolMaterial = symbol.sprite.material as THREE.SpriteMaterial;
+        symbolMaterial.opacity = pulse * wallSymbolVisibility;
+      }
+
+      renderer.render(scene, camera);
+      animationFrameId = requestAnimationFrame(animate);
+    };
+
+    animate();
+
+    return () => {
+      cancelAnimationFrame(animationFrameId);
+      window.removeEventListener("resize", onResize);
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      mountEl.removeEventListener("mousedown", onMouseDown);
+      window.removeEventListener("mouseup", onMouseUp);
+      window.removeEventListener("mousemove", onMouseMove);
+      mountEl.classList.remove("is-dragging");
+
+      scene.traverse((object) => {
+        const mesh = object as THREE.Mesh;
+        if (mesh.geometry) {
+          mesh.geometry.dispose();
+        }
+        const material = mesh.material;
+        if (Array.isArray(material)) {
+          material.forEach((item) => item.dispose());
+        } else if (material) {
+          material.dispose();
+        }
+      });
+
+      renderer.dispose();
+      for (const texture of floatingWallSymbolTextures) {
+        texture.dispose();
+      }
+      if (renderer.domElement.parentElement === mountEl) {
+        mountEl.removeChild(renderer.domElement);
+      }
+    };
+  }, [
+    fadeBuildupTo,
+    isDevBuild,
+    playDistantExplosionOneShot,
+    playEndingRumbleOneShot,
+    playFlickerZapOneShot,
+    playFootstepOneShot,
+    speechSupported,
+  ]);
+
+  const handleBeginQuestions = () => {
+    phaseRef.current = "questions";
+    setPhase("questions");
+    setRevealProgress(0);
+    setIsRevealing(true);
+    revealProgressRef.current = 0;
+    isRevealingRef.current = true;
+
+    const revealAudio = revealAudioRef.current;
+    if (revealAudio) {
+      try {
+        revealAudio.pause();
+        revealAudio.currentTime = 0;
+        revealAudio.muted = false;
+        revealAudio.volume = 0;
+
+        const playAttempt = revealAudio.play();
+        if (playAttempt && typeof playAttempt.then === "function") {
+          void playAttempt
+            .then(() => {
+              revealAudioStartedRef.current = true;
+            })
+            .catch(() => {
+              revealAudioStartedRef.current = false;
+            });
+        } else {
+          revealAudioStartedRef.current = true;
+        }
+      } catch {
+        revealAudioStartedRef.current = false;
+      }
+    }
+
+    ensureDarkHorrorAmbientPlaying();
+
+    void startShipHum().catch(() => {
+      // Never block start flow on audio context failures.
+    });
+  };
+
   const handlePick = (choice: ChoiceInternal, optionNumber: number) => {
-    if (phase !== "questions" || !currentTurn) return;
+    if (!currentTurn || phase !== "questions") return;
+
+    stopQuestionSpeech();
+
+    if (choice.delta !== 0) {
+      triggerAlienHeadReaction(choice.delta);
+    }
 
     const scoreBefore = score;
-    const scoreAfter = Math.max(
-      SCORE_MIN,
-      Math.min(SCORE_MAX, scoreBefore + choice.delta)
-    );
+    const scoreAfter = Math.max(SCORE_MIN, Math.min(SCORE_MAX, score + choice.delta));
+    const nextTurnIndex = turnIndex + 1;
 
     setScore(scoreAfter);
     setHistory((prev) => [
       ...prev,
       {
-        turnId: currentTurn.id,
+        turnId: turnIndex + 1,
         chosenOptionNumber: optionNumber,
         questionText: currentTurn.alienLine,
         chosenAnswerText: choice.text,
@@ -600,268 +3992,181 @@ export default function App() {
       },
     ]);
 
-    const nextId =
-      choice.outcome === "HIGH" ? currentTurn.nextHigh : currentTurn.nextLow;
-
-    if (nextId) setTurnId(nextId);
-    else setTurnId(999999);
+    if (nextTurnIndex >= QUESTION_CONTENT.length) {
+      endingSavedOutcomeRef.current = scoreAfter >= EARTH_SAVED_THRESHOLD;
+      setPhase("ending");
+    } else {
+      setTurnIndex(nextTurnIndex);
+    }
   };
 
-  const reset = () => {
+  const handleSkipQuestion = () => {
+    if (phase !== "questions") return;
+
+    stopQuestionSpeech();
+    const nextTurnIndex = turnIndex + 1;
+
+    if (nextTurnIndex >= QUESTION_CONTENT.length) {
+      endingSavedOutcomeRef.current = score >= EARTH_SAVED_THRESHOLD;
+      setPhase("ending");
+      return;
+    }
+
+    setTurnIndex(nextTurnIndex);
+  };
+
+  const handleRestart = () => {
+    stopQuestionSpeech();
+    clearPreparedSpeechCache();
+    void stopShipHum();
     setScore(0);
-    setTurnId(1);
+    setTurnIndex(0);
     setHistory([]);
     setEndingExplanation("");
+    setRevealProgress(0);
+    setIsRevealing(false);
+    setEndingBlackoutOpacity(0);
+    setEndingFlashOpacity(0);
+    setEndingPanelVisible(false);
+    revealProgressRef.current = 0;
+    isRevealingRef.current = false;
+    endingBlackoutOpacityRef.current = 0;
+    endingFlashOpacityRef.current = 0;
+    endingPanelVisibleRef.current = false;
+    endingCinematicRef.current = {
+      stage: "inactive",
+      stageStartedAt: 0,
+      blastStartedAt: 0,
+      lastRumbleAt: 0,
+    };
+    phaseRef.current = "intro";
     setPhase("intro");
   };
 
-  useEffect(() => {
-    if (!isGameOver) return;
-
-    let cancelled = false;
-    const saved = score >= EARTH_SAVED_THRESHOLD;
-
-    generateOutcomeExplanation(saved, score, history).then((text) => {
-      if (cancelled) return;
-      setEndingExplanation(text);
-    });
-
-    return () => {
-      cancelled = true;
-    };
-  }, [isGameOver, score, history]);
-
-  useEffect(() => {
-    let soundKey = "";
-    let soundSrc = "";
-
-    if (phase === "intro") {
-      soundKey = "intro";
-      soundSrc = INTRO_SOUND;
-    } else if (phase === "questions" && currentTurn) {
-      soundKey = `question-${currentTurn.id}`;
-      soundSrc = getQuestionSoundSrc(currentTurn.id);
-    } else if (isGameOver) {
-      const saved = score >= EARTH_SAVED_THRESHOLD;
-      soundKey = saved ? "ending-saved" : "ending-destroyed";
-      soundSrc = saved ? ENDING_SAVED_SOUND : ENDING_DESTROYED_SOUND;
-    }
-
-    if (!soundSrc || !soundKey) return;
-    if (lastPlayedSoundKeyRef.current === soundKey) return;
-    lastPlayedSoundKeyRef.current = soundKey;
-
-    const audio = new Audio(soundSrc);
-    audio.preload = "auto";
-    audio.play().catch(() => {
-      // Ignore autoplay blocks; user interaction will allow subsequent sounds.
-    });
-
-    return () => {
-      audio.pause();
-      audio.currentTime = 0;
-    };
-  }, [phase, currentTurn, isGameOver, score]);
-
-  const appShellClass =
-    "w-full max-h-[calc(100dvh-1.5rem)] sm:max-h-[calc(100dvh-2rem)] flex flex-col";
-  const questionBodyWidthClass = "w-full mx-auto max-w-[calc((100vh-20rem)*16/9)]";
-  const questionStageBoxClass = "relative aspect-[16/9] overflow-hidden";
-
-  if (phase === "intro") {
-    return (
-      <div className="min-h-dvh bg-black text-white flex items-center justify-center p-3 sm:p-4">
-        <div className={appShellClass}>
-          <div className="mb-3" />
-
-          <div className={questionBodyWidthClass}>
-            <div className={questionStageBoxClass}>
-              <img
-                src={INTRO_SCREEN_BG}
-                alt="Intro screen background"
-                className="absolute inset-0 w-full h-full object-cover"
-                draggable={false}
-              />
-            </div>
-
-            <div className="mt-3 border border-white/10 bg-black/45 backdrop-blur-sm p-2 sm:p-4">
-              <div className="text-[clamp(12px,1.2vw,18px)] leading-[1.35] text-white/95">
-                Greetings. This is a game you have been selected to play that will
-                determine the fate of your life. There will be a sequence of questions
-                you must answer to safely return back to Earth. If you choose to disobey,
-                your life will no longer exist.
-              </div>
-
-              <div className="mt-3 sm:mt-4">
-                <button
-                  onClick={() => setPhase("questions")}
-                  className="w-full bg-white text-black font-semibold py-2.5 sm:py-3 text-base sm:text-lg hover:opacity-90 transition"
-                >
-                  Begin Questions
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-3" />
-        </div>
-      </div>
-    );
-  }
-
-  if (isGameOver) {
-    const saved = score >= EARTH_SAVED_THRESHOLD;
-    const endingBackground = saved ? "/spared.jpg" : "/destroyed.jpg";
-    const verdictLine = saved
-      ? "The alien lowers its gaze and the ship begins to fade, its final words echoing softly—\"Earth may continue\""
-      : "The alien’s many voices merge into one cold verdict—‘Earth has failed the protocol’—and in the silence that follows, a bright explosion swallows the sky.";
-
-    return (
-      <div className="min-h-dvh bg-black text-white flex items-center justify-center p-3 sm:p-4">
-        <div className={appShellClass}>
-          <div className="mb-3" />
-
-          <div className={questionBodyWidthClass}>
-            <div className={`${questionStageBoxClass} border border-white/10 bg-white/5 shadow-2xl`}>
-              <img
-                src={endingBackground}
-                alt="Background"
-                className="absolute inset-0 w-full h-full object-cover"
-                draggable={false}
-              />
-              <div className="absolute inset-0 pointer-events-none bg-black/10" />
-
-              <div className="absolute inset-x-[5%] bottom-[clamp(6px,1.8vh,40px)] z-10">
-                <div className="w-full max-h-[34%] overflow-y-auto bg-black/45 backdrop-blur-sm border border-white/15 p-2 sm:p-3">
-                  <div className="text-[clamp(8px,1.9vw,12px)] sm:text-[clamp(10px,1vw,14px)] uppercase tracking-widest opacity-70 mb-1 sm:mb-1.5">
-                    Final Verdict
-                  </div>
-                  <div className="text-[clamp(9px,2.6vw,14px)] sm:text-[clamp(12px,1.2vw,18px)] leading-[1.25]">
-                    {verdictLine}
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="mt-3 border border-white/10 bg-black/45 backdrop-blur-sm p-3 sm:p-4">
-              <div className="text-[12px] sm:text-[clamp(10px,1vw,14px)] uppercase tracking-widest opacity-75 mb-1 sm:mb-1.5">
-                Explanation
-              </div>
-              <div className="max-h-[clamp(130px,28dvh,260px)] overflow-y-auto pr-1">
-                <p className="text-[clamp(11px,1.1vw,16px)] leading-[1.35] opacity-95 mb-2">
-                  Communication Score: {score}. Your Protocol Score measures how well your choices show humanity’s ability to communicate and coexist beyond human-centered thinking: points are added when answers show openness, empathy, adaptation, and respect for non-human intelligence (animals, ecosystems, AI, alien systems), and points are removed when answers reflect human bias—like assuming humans are the center, forcing unknown signals into human definitions, or treating other forms of life and intelligence only as tools. The score ranges from -10 to +10, and the alien uses it to judge whether humanity is capable of changing its perspective: if your final score is 2 or higher, Earth is spared; if it is below 2, Earth is destroyed.
-                </p>
-                <p className="text-[12px] sm:text-[clamp(10px,1vw,14px)] uppercase tracking-widest opacity-75 mb-1 sm:mb-1.5">
-                  {endingExplanation ? "Generated Analysis:" : "Generating Analysis of your choices."}
-                </p>
-                <p className="text-[clamp(11px,1.1vw,16px)] leading-[1.35] opacity-95">
-                  {!endingExplanation
-                    ? "Generating..."
-                    : endingExplanation || fallbackOutcomeExplanation(saved, score, history)}
-                </p>
-              </div>
-
-              <div className="pt-3 mt-3 border-t border-white/10">
-                <button
-                  onClick={reset}
-                  className="w-full bg-white text-black font-semibold py-3 hover:opacity-90 transition"
-                >
-                  Play Again
-                </button>
-              </div>
-            </div>
-          </div>
-
-          <div className="mt-3" />
-        </div>
-      </div>
-    );
-  }
-
-  if (!currentTurn) return null;
-
-  const backgroundPerQuestionSrc = GAMEPLAY_BG;
-  const alienSrc = getScoreAlienSrc(score);
-  const questionEffectSrc = getQuestionEffectSrc(currentTurn.id);
-  const questionSegments = parseQuestionSegments(currentTurn.alienLine);
+  const saved = score >= EARTH_SAVED_THRESHOLD;
+  const verdictLine = saved
+    ? "The alien lowers its gaze and the ship begins to fade, its final words echoing softly—\"Earth may continue\""
+    : "The alien’s many voices merge into one cold verdict—‘Earth has failed the protocol’—and in the silence that follows, a bright explosion swallows the sky.";
+  const revealBlackoutOpacity = phase === "intro" ? 0 : isRevealing ? Math.max(0, 1 - revealProgress) : 0;
+  const sceneBlackoutOpacity = Math.max(revealBlackoutOpacity, endingBlackoutOpacity);
 
   return (
-    <div className="min-h-dvh bg-black text-white flex items-center justify-center p-3 sm:p-4">
-      <div className={`${appShellClass} overflow-y-auto`}>
-        <div className="mb-3" />
+    <main className="game-shell" onClickCapture={handleGlobalButtonClick}>
+      <div ref={mountRef} className="scene-mount" aria-label="3D alien spaceship scene" />
+      <div
+        className="scene-blackout"
+        style={{ opacity: sceneBlackoutOpacity }}
+        aria-hidden="true"
+      />
+      <div className="scene-flashout" style={{ opacity: endingFlashOpacity }} aria-hidden="true" />
+      <div className="scene-vignette" aria-hidden="true" />
 
-        <div className={`${questionBodyWidthClass} border border-white/10 bg-white/5 shadow-2xl overflow-hidden`}>
-          <div className={questionStageBoxClass}>
-            <img
-              src={backgroundPerQuestionSrc}
-              alt="Question background"
-              className="absolute inset-0 w-full h-full object-cover"
-              draggable={false}
-            />
-            <div className="absolute top-2 right-2 sm:top-3 sm:right-3 z-20 bg-black/45 backdrop-blur-sm border border-white/15 px-2 py-1 text-[clamp(10px,1vw,14px)] leading-none">
-              Question {currentTurn.id} / {TOTAL_TURNS}
-            </div>
-            <img
-              src={alienSrc}
-              alt="Alien"
-              className="absolute inset-0 w-full h-full object-contain pointer-events-none"
-              draggable={false}
-            />
-            <img
-              src={questionEffectSrc}
-              alt="Question effect layer"
-              className="absolute inset-0 w-full h-full object-contain pointer-events-none"
-              draggable={false}
-            />
-            <div className="absolute inset-0 pointer-events-none bg-black/10" />
+      <aside className="game-hud">
+        <div className="volume-row">
+          <label className="volume-label" htmlFor="master-volume">
+            Volume
+          </label>
+          <input
+            id="master-volume"
+            className="volume-slider"
+            type="range"
+            min={0}
+            max={100}
+            value={masterVolume}
+            onChange={(event) => {
+              setMasterVolume(Number(event.target.value));
+            }}
+          />
+          <span className="volume-value">{masterVolume}%</span>
+        </div>
 
-            <div className="absolute inset-x-[7%] sm:inset-x-[6%] md:inset-x-[5%] bottom-[clamp(6px,1.8vh,40px)] z-10">
-              <div className="w-full max-h-[28%] sm:max-h-[33%] md:max-h-[38%] overflow-y-auto bg-black/45 backdrop-blur-sm border border-white/15 p-1 sm:p-2 md:p-3">
-                <div className="text-[clamp(8px,1.9vw,12px)] sm:text-[clamp(10px,1vw,14px)] uppercase tracking-widest opacity-70 mb-1 sm:mb-1.5">
-                  Alien
-                </div>
-                <div className="text-[clamp(9px,2.6vw,14px)] sm:text-[clamp(12px,1.2vw,18px)] leading-[1.25]">
-                  {questionSegments.map((segment, index) => (
-                    <span key={index} className={segment.isSpeech ? "" : "italic"}>
-                      {segment.isSpeech ? `"${segment.text}"` : segment.text}
-                      {index < questionSegments.length - 1 ? " " : ""}
-                    </span>
-                  ))}
-                </div>
+        {phase !== "intro" && (
+          <div className="status-row">
+          <span className="desktop-only-hint">WASD to walk</span>
+          <span>Drag screen to look</span>
+          </div>
+        )}
+
+        {phase === "intro" && (
+          <div className="qa-panel qa-intro-panel">
+            <div className="qa-title">Transmission Protocol</div>
+            <p className="qa-text">
+              Greetings. This is a game you have been selected to play that will determine the fate of your life. There
+              will be a sequence of questions you must answer to safely return back to Earth. If you choose to disobey,
+              your life will no longer exist.
+            </p>
+            <button className="qa-btn" onClick={handleBeginQuestions}>
+              Begin Questions
+            </button>
+          </div>
+        )}
+
+        {phase === "questions" && currentTurn && (
+          <div
+            className="qa-panel qa-question-panel"
+            style={{
+              opacity: isRevealing ? revealProgress : 1,
+              transform: `translate(-50%, ${(1 - (isRevealing ? revealProgress : 1)) * 6}px)`,
+              pointerEvents: isRevealing ? "none" : "auto",
+            }}
+          >
+            <div className="qa-title">ALIEN:</div>
+            <p className="qa-text qa-question-text" aria-live="polite">
+              {typedAlienText}
+            </p>
+            {isDevBuild && (
+              <button className="qa-btn" onClick={handleSkipQuestion} style={{ marginTop: "0.45rem" }}>
+                DEV: Skip Question
+              </button>
+            )}
+            <div className={`qa-answer-block${answersVisible ? " is-visible" : ""}`}>
+              <div className="qa-title">ANSWER:</div>
+              <div className="qa-choices">
+                {displayChoices.map((choice, index) => (
+                  <button
+                    key={index}
+                    className="qa-btn"
+                    onClick={() => handlePick(choice, index + 1)}
+                    disabled={!answersVisible}
+                  >
+                    {choice.text}
+                  </button>
+                ))}
               </div>
             </div>
           </div>
-        </div>
+        )}
 
-        <div className={`${questionBodyWidthClass} mt-3 border border-white/10 bg-black/45 backdrop-blur-sm p-2 sm:p-4`}>
-          <div className="text-[12px] sm:text-[clamp(10px,1vw,14px)] uppercase tracking-widest opacity-75 mb-1 sm:mb-1.5">
-            Answer:
-          </div>
-          <div className="grid grid-cols-2 auto-rows-[clamp(46px,6.8vh,76px)] gap-2 sm:gap-3 lg:gap-4">
-            {displayChoices.map((choice, idx) => (
-              <button
-                key={idx}
-                onClick={() => handlePick(choice, idx + 1)}
-                className="relative h-full border border-white/20 bg-white/10 hover:bg-white/15 transition overflow-hidden px-2 py-1 sm:px-3 sm:py-1.5 text-left"
-                aria-label={`OPTION ${idx + 1}`}
-              >
-                <div className="absolute inset-0 border-2 border-dashed border-white/20 pointer-events-none" />
-                <div className="relative h-full w-full flex items-center">
-                  <div className="w-full text-[clamp(11px,1.2vw,17px)] leading-[1.2] opacity-95 overflow-hidden [display:-webkit-box] [-webkit-line-clamp:3] [-webkit-box-orient:vertical]">
-                    "{normalizeAnswerText(choice.text)}"
-                  </div>
-                </div>
-              </button>
-            ))}
-          </div>
-        </div>
+        {phase === "ending" && endingPanelVisible && (
+          <div className="qa-panel">
+            <div className="ending-verdict-inline">
+              <div className="qa-title">Final Verdict</div>
+              <p className="qa-text">{verdictLine}</p>
+            </div>
 
-        <div className="mt-3 px-1">
-          <button onClick={reset} className="text-sm underline opacity-80 hover:opacity-100">
-            Reset
-          </button>
-        </div>
-      </div>
-    </div>
+            <div className="qa-title qa-subtitle">Explanation</div>
+            <p className="qa-text qa-analysis">
+              Communication Score: {score}. Your Protocol Score measures how well your choices show humanity’s ability
+              to communicate and coexist beyond human-centered thinking: points are added when answers show openness,
+              empathy, adaptation, and respect for non-human intelligence (animals, ecosystems, AI, alien systems), and
+              points are removed when answers reflect human bias—like assuming humans are the center, forcing unknown
+              signals into human definitions, or treating other forms of life and intelligence only as tools. The score
+              ranges from -10 to +10, and the alien uses it to judge whether humanity is capable of changing its
+              perspective: if your final score is 2 or higher, Earth is spared; if it is below 2, Earth is destroyed.
+            </p>
+
+            <div className="qa-title qa-subtitle">
+              {endingExplanation ? "Generated Analysis:" : "Generating Analysis of your choices."}
+            </div>
+            <p className="qa-text qa-analysis">
+              {!endingExplanation ? "Generating..." : endingExplanation || fallbackOutcomeExplanation(saved, score, history)}
+            </p>
+            <button className="qa-btn" onClick={handleRestart}>
+              Restart Questions
+            </button>
+          </div>
+        )}
+      </aside>
+    </main>
   );
 }
