@@ -310,8 +310,34 @@ function pickCreepyVoice(voices: SpeechSynthesisVoice[]) {
   const findPreferredVoice = (namePattern: RegExp) =>
     voices.find((voice) => namePattern.test(voice.name) && /^en/i.test(voice.lang));
 
-  if (platform.includes("mac")) {
-    const macPreferred = findPreferredVoice(/^alex$/i) ?? findPreferredVoice(/\balex\b/i);
+  const findWithPriorityPatterns = (candidateVoices: SpeechSynthesisVoice[], isMacPlatform: boolean) => {
+    const voicePriority = [
+      /zira|hazel|hedda|susan|sara|mark|david|zira/i,
+      /microsoft|google|samantha|alex|victoria/i,
+      /en[-_](us|gb|ca|au)/i,
+      /en/i,
+    ];
+
+    const filteredCandidates = isMacPlatform
+      ? candidateVoices.filter((voice) => !/\balex\b/i.test(voice.name))
+      : candidateVoices;
+
+    for (const pattern of voicePriority) {
+      const matched = filteredCandidates.find((voice) => pattern.test(`${voice.name} ${voice.lang}`));
+      if (matched) return matched;
+    }
+
+    return null;
+  };
+
+  const isMacPlatform = platform.includes("mac");
+
+  if (isMacPlatform) {
+    const macPreferred =
+      findPreferredVoice(/^aaron$/i) ??
+      findPreferredVoice(/\baaron\b/i) ??
+      findPreferredVoice(/^samantha$/i) ??
+      findPreferredVoice(/\bsamantha\b/i);
     if (macPreferred) return macPreferred;
   }
 
@@ -321,17 +347,12 @@ function pickCreepyVoice(voices: SpeechSynthesisVoice[]) {
     if (windowsPreferred) return windowsPreferred;
   }
 
-  const voicePriority = [
-    /zira|hazel|hedda|susan|sara|mark|david|zira/i,
-    /microsoft|google|samantha|alex|victoria/i,
-    /en[-_](us|gb|ca|au)/i,
-    /en/i,
-  ];
+  const englishVoices = voices.filter((voice) => /^en/i.test(voice.lang));
+  const englishMatch = findWithPriorityPatterns(englishVoices, isMacPlatform);
+  if (englishMatch) return englishMatch;
 
-  for (const pattern of voicePriority) {
-    const matched = voices.find((voice) => pattern.test(`${voice.name} ${voice.lang}`));
-    if (matched) return matched;
-  }
+  const anyLanguageMatch = findWithPriorityPatterns(voices, isMacPlatform);
+  if (anyLanguageMatch) return anyLanguageMatch;
 
   return voices[0] ?? null;
 }
