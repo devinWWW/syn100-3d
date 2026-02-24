@@ -95,11 +95,18 @@ const SCORE_MAX = 10;
 const TOTAL_TURNS = 10;
 const EARTH_SAVED_THRESHOLD = 2;
 const DARK_HORROR_AMBIENT_VOLUME_SCALE = 0.06;
-const OCEAN_AMBIENCE_VOLUME_SCALE = 0.72;
+const OCEAN_AMBIENCE_VOLUME_SCALE = 1.0;
 const DISTANT_EXPLOSION_VOLUME_SCALE = 0.56;
 const ENDMUSIC_VOLUME_SCALE = 0.03;
 const BUILDUP_VOLUME_SCALE = 0.4;
 const BUILDUP_TRIM_OFFSET_SECONDS = 6;
+const SHAKING_SHIP_VOLUME_SCALE = 0.32;
+const FALLING_SHIP_VOLUME_SCALE = 0.42;
+const HEAD_SHAKE_NO_VOLUME_SCALE = 0.22;
+const HEAD_SHAKE_YES_VOLUME_SCALE = 0.2;
+const HEAD_SHAKE_NO_TRIM_SECONDS = 0.08;
+const FLICKER_ZAP_VOLUME_SCALE = 0.45;
+const FLICKER_ZAP_SLICE_SECONDS = 0.16;
 
 function shuffle<T>(arr: T[]) {
   const a = [...arr];
@@ -120,6 +127,15 @@ function normalizeAnswerText(text: string) {
 
 function clamp(value: number, min: number, max: number) {
   return Math.max(min, Math.min(max, value));
+}
+
+function normalizeAngleRadians(angle: number) {
+  const twoPi = Math.PI * 2;
+  return ((((angle + Math.PI) % twoPi) + twoPi) % twoPi) - Math.PI;
+}
+
+function shortestAngleDelta(from: number, to: number) {
+  return normalizeAngleRadians(to - from);
 }
 
 function getQuestionSpeechProfile(contextText: string): QuestionSpeechProfile {
@@ -777,6 +793,64 @@ function createSpaceshipInterior(): THREE.Group {
 
   const wallPanelTexture = createMetalPanelTexture("#555b63", "#3d434c");
   const floorPanelTexture = createMetalPanelTexture("#20242a", "#323741");
+  const ceilingPanelTexture = createMetalPanelTexture("#5e6672", "#4a5260");
+  const roomRadius = 6.4;
+  const roomHeight = 4.8;
+  const roomCenterY = 1.95;
+  const sideWindowRadius = 6.08;
+  const sideWindowCenterY = 2.08;
+  const sideWindowInnerWidth = 3.737;
+  const sideWindowInnerHeight = 1.608;
+  const sideWindowBorderThickness = 0.08;
+  const sideWindowFrameDepth = 0.04;
+
+  const createRoomWindowMaskTexture = (wallRadiusForUv: number, wallHeightForUv: number, wallCenterYForUv: number) => {
+    const width = 2048;
+    const height = 1024;
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const context = canvas.getContext("2d");
+    if (!context) return null;
+
+    context.fillStyle = "#ffffff";
+    context.fillRect(0, 0, width, height);
+
+    const openWidthUv =
+      (sideWindowInnerWidth + sideWindowBorderThickness * 1.6) / (Math.PI * 2 * wallRadiusForUv);
+    const openHeightV = (sideWindowInnerHeight + sideWindowBorderThickness * 1.6) / wallHeightForUv;
+    const centerV = THREE.MathUtils.clamp((sideWindowCenterY - wallCenterYForUv) / wallHeightForUv + 0.5, 0, 1);
+    const uvAngleOffset = 0.25;
+    const angleToU = (angle: number) => ((((angle / (Math.PI * 2) + uvAngleOffset) % 1) + 1) % 1);
+
+    const drawHoleAt = (centerU: number) => {
+      const leftPx = (centerU - openWidthUv * 0.5) * width;
+      const topPx = (1 - (centerV + openHeightV * 0.5)) * height;
+      const holeWidthPx = openWidthUv * width;
+      const holeHeightPx = openHeightV * height;
+
+      context.fillStyle = "#000000";
+      context.fillRect(leftPx, topPx, holeWidthPx, holeHeightPx);
+
+      if (leftPx < 0) {
+        context.fillRect(leftPx + width, topPx, holeWidthPx, holeHeightPx);
+      }
+      if (leftPx + holeWidthPx > width) {
+        context.fillRect(leftPx - width, topPx, holeWidthPx, holeHeightPx);
+      }
+    };
+
+    drawHoleAt(angleToU(0));
+    drawHoleAt(angleToU(Math.PI));
+
+    const texture = new THREE.CanvasTexture(canvas);
+    texture.wrapS = THREE.RepeatWrapping;
+    texture.wrapT = THREE.ClampToEdgeWrapping;
+    return texture;
+  };
+
+  const roomWindowMaskTexture = createRoomWindowMaskTexture(roomRadius, roomHeight, roomCenterY);
+  const outerWindowMaskTexture = createRoomWindowMaskTexture(7.25, 5.2, 2.2);
 
   if (wallPanelTexture) {
     wallPanelTexture.repeat.set(6.5, 2.2);
@@ -786,13 +860,20 @@ function createSpaceshipInterior(): THREE.Group {
     floorPanelTexture.repeat.set(8, 8);
   }
 
+  if (ceilingPanelTexture) {
+    ceilingPanelTexture.repeat.set(7, 7);
+  }
+
   const outerWall = new THREE.Mesh(
     new THREE.CylinderGeometry(7.25, 7.25, 5.2, 64, 1, true),
     new THREE.MeshStandardMaterial({
-      color: "#575d66",
+      color: "#737a84",
       map: wallPanelTexture ?? undefined,
-      roughness: 0.5,
-      metalness: 0.42,
+      alphaMap: outerWindowMaskTexture ?? undefined,
+      transparent: true,
+      alphaTest: outerWindowMaskTexture ? 0.45 : 0,
+      roughness: 0.78,
+      metalness: 0.16,
       side: THREE.BackSide,
     }),
   );
@@ -802,35 +883,38 @@ function createSpaceshipInterior(): THREE.Group {
   const outerFloor = new THREE.Mesh(
     new THREE.CircleGeometry(7.25, 64),
     new THREE.MeshStandardMaterial({
-      color: "#24292f",
+      color: "#878c94",
       map: floorPanelTexture ?? undefined,
-      roughness: 0.42,
-      metalness: 0.64,
+      roughness: 0.8,
+      metalness: 0.14,
     }),
   );
   outerFloor.rotation.x = -Math.PI / 2;
   ship.add(outerFloor);
 
   const room = new THREE.Mesh(
-    new THREE.CylinderGeometry(6.4, 6.4, 4.8, 56, 1, true),
+    new THREE.CylinderGeometry(roomRadius, roomRadius, roomHeight, 56, 1, true),
     new THREE.MeshStandardMaterial({
-      color: "#343943",
+      color: "#727983",
       map: wallPanelTexture ?? undefined,
-      roughness: 0.64,
-      metalness: 0.34,
+      alphaMap: roomWindowMaskTexture ?? undefined,
+      transparent: true,
+      alphaTest: roomWindowMaskTexture ? 0.45 : 0,
+      roughness: 0.8,
+      metalness: 0.14,
       side: THREE.BackSide,
     }),
   );
-  room.position.y = 1.95;
+  room.position.y = roomCenterY;
   ship.add(room);
 
   const floor = new THREE.Mesh(
     new THREE.CircleGeometry(6.4, 56),
     new THREE.MeshStandardMaterial({
-      color: "#20242c",
+      color: "#9398a0",
       map: floorPanelTexture ?? undefined,
-      roughness: 0.5,
-      metalness: 0.5,
+      roughness: 0.82,
+      metalness: 0.12,
     }),
   );
   floor.rotation.x = -Math.PI / 2;
@@ -838,7 +922,12 @@ function createSpaceshipInterior(): THREE.Group {
 
   const ceiling = new THREE.Mesh(
     new THREE.CircleGeometry(6.4, 56),
-    new THREE.MeshStandardMaterial({ color: "#3a404a", roughness: 0.62, metalness: 0.24 }),
+    new THREE.MeshStandardMaterial({
+      color: "#7e8691",
+      map: ceilingPanelTexture ?? undefined,
+      roughness: 0.72,
+      metalness: 0.18,
+    }),
   );
   ceiling.rotation.x = Math.PI / 2;
   ceiling.position.y = 4.35;
@@ -854,7 +943,7 @@ function createSpaceshipInterior(): THREE.Group {
 
   for (let i = 0; i < 2; i++) {
     const ring = new THREE.Mesh(new THREE.TorusGeometry(5.15 + i * 0.65, 0.08, 20, 80), ringMaterial);
-    ring.position.y = 1.92 + i * 0.92;
+    ring.position.y = 1.49 + i * 0.92 + (i === 1 ? 0.14 : 0);
     ring.rotation.x = Math.PI / 2;
     ship.add(ring);
   }
@@ -868,15 +957,23 @@ function createSpaceshipInterior(): THREE.Group {
 
   const wireMaterial = new THREE.MeshStandardMaterial({
     color: "#6a5418",
-    emissive: "#d2ad47",
-    emissiveIntensity: 0.95,
+    emissive: "#7a6121",
+    emissiveIntensity: 0.24,
     roughness: 0.32,
     metalness: 0.16,
-    transparent: true,
-    opacity: 0.2,
+    transparent: false,
+    opacity: 1,
   });
 
   const wallWireRadius = 6.22;
+  const wireWindowGapHalfAngle =
+    (sideWindowInnerWidth * 0.5 + sideWindowBorderThickness * 2) / wallWireRadius + 0.1;
+  const isInWindowGap = (angle: number) => {
+    return (
+      Math.abs(shortestAngleDelta(angle, 0)) < wireWindowGapHalfAngle ||
+      Math.abs(shortestAngleDelta(angle, Math.PI)) < wireWindowGapHalfAngle
+    );
+  };
 
   const wireRingTop = new THREE.Mesh(new THREE.TorusGeometry(wallWireRadius, 0.042, 12, 120), wireMaterial);
   wireRingTop.position.y = 3.88;
@@ -890,6 +987,9 @@ function createSpaceshipInterior(): THREE.Group {
 
   for (let i = 0; i < 18; i++) {
     const angle = (i / 18) * Math.PI * 2;
+    if (isInWindowGap(angle)) {
+      continue;
+    }
     const radial = wallWireRadius;
     const x = Math.cos(angle) * radial;
     const z = Math.sin(angle) * radial;
@@ -906,6 +1006,144 @@ function createSpaceshipInterior(): THREE.Group {
     const cable = new THREE.Mesh(new THREE.TubeGeometry(curve, 30, 0.024, 10, false), wireMaterial);
     ship.add(cable);
   }
+
+  const deepSpaceStarCount = 1550;
+  const deepSpaceMinRadius = 78;
+  const deepSpaceMaxRadius = 146;
+  const deepSpacePositions = new Float32Array(deepSpaceStarCount * 3);
+  for (let i = 0; i < deepSpaceStarCount; i++) {
+    const i3 = i * 3;
+    const direction = new THREE.Vector3(
+      Math.random() * 2 - 1,
+      (Math.random() * 2 - 1) * 0.72,
+      Math.random() * 2 - 1,
+    ).normalize();
+    const radius = deepSpaceMinRadius + Math.random() * (deepSpaceMaxRadius - deepSpaceMinRadius);
+    deepSpacePositions[i3] = direction.x * radius;
+    deepSpacePositions[i3 + 1] = direction.y * radius + 1.95;
+    deepSpacePositions[i3 + 2] = direction.z * radius;
+  }
+
+  const deepSpaceGeometry = new THREE.BufferGeometry();
+  deepSpaceGeometry.setAttribute("position", new THREE.BufferAttribute(deepSpacePositions, 3));
+  const deepSpaceStars = new THREE.Points(
+    deepSpaceGeometry,
+    new THREE.PointsMaterial({
+      color: "#c9cfdb",
+      size: 0.07,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: 0.62,
+      depthWrite: false,
+      depthTest: true,
+      fog: false,
+    }),
+  );
+  deepSpaceStars.name = "deep-space-stars";
+  ship.add(deepSpaceStars);
+
+  const createSideWallWindow = (angle: number, showEarth = false) => {
+    const windowGroup = new THREE.Group();
+    windowGroup.position.set(
+      Math.cos(angle) * sideWindowRadius,
+      sideWindowCenterY,
+      Math.sin(angle) * sideWindowRadius,
+    );
+    windowGroup.lookAt(0, sideWindowCenterY, 0);
+
+    const frameOuterMaterial = new THREE.MeshStandardMaterial({
+      color: "#3a4452",
+      emissive: "#1c2430",
+      emissiveIntensity: 0.22,
+      roughness: 0.56,
+      metalness: 0.38,
+    });
+
+    const frameOuterTop = new THREE.Mesh(
+      new THREE.BoxGeometry(
+        sideWindowInnerWidth + sideWindowBorderThickness * 2,
+        sideWindowBorderThickness,
+        sideWindowFrameDepth,
+      ),
+      frameOuterMaterial,
+    );
+    frameOuterTop.position.set(0, sideWindowInnerHeight * 0.5 + sideWindowBorderThickness * 0.5, -0.02);
+    windowGroup.add(frameOuterTop);
+
+    const frameOuterBottom = new THREE.Mesh(
+      new THREE.BoxGeometry(
+        sideWindowInnerWidth + sideWindowBorderThickness * 2,
+        sideWindowBorderThickness,
+        sideWindowFrameDepth,
+      ),
+      frameOuterMaterial,
+    );
+    frameOuterBottom.position.set(0, -sideWindowInnerHeight * 0.5 - sideWindowBorderThickness * 0.5, -0.02);
+    windowGroup.add(frameOuterBottom);
+
+    const frameOuterLeft = new THREE.Mesh(
+      new THREE.BoxGeometry(
+        sideWindowBorderThickness,
+        sideWindowInnerHeight + sideWindowBorderThickness * 2,
+        sideWindowFrameDepth,
+      ),
+      frameOuterMaterial,
+    );
+    frameOuterLeft.position.set(-sideWindowInnerWidth * 0.5 - sideWindowBorderThickness * 0.5, 0, -0.02);
+    windowGroup.add(frameOuterLeft);
+
+    const frameOuterRight = new THREE.Mesh(
+      new THREE.BoxGeometry(
+        sideWindowBorderThickness,
+        sideWindowInnerHeight + sideWindowBorderThickness * 2,
+        sideWindowFrameDepth,
+      ),
+      frameOuterMaterial,
+    );
+    frameOuterRight.position.set(sideWindowInnerWidth * 0.5 + sideWindowBorderThickness * 0.5, 0, -0.02);
+    windowGroup.add(frameOuterRight);
+
+    const windowPaneGlow = new THREE.Mesh(
+      new THREE.PlaneGeometry(sideWindowInnerWidth, sideWindowInnerHeight),
+      new THREE.MeshBasicMaterial({
+        color: "#6f84a0",
+        transparent: true,
+        opacity: 0.045,
+        depthWrite: false,
+        side: THREE.DoubleSide,
+      }),
+    );
+    windowPaneGlow.position.set(0, 0, -0.035);
+    windowGroup.add(windowPaneGlow);
+
+    if (showEarth) {
+      const windowEarthGroup = new THREE.Group();
+      windowEarthGroup.name = "left-window-earth";
+      const earthOrbitRadius = 78;
+      const earthOrbitStartAngle = Math.PI + 0.55;
+      const earthOrbitY = 2.41;
+      windowEarthGroup.position.set(
+        Math.cos(earthOrbitStartAngle) * earthOrbitRadius,
+        earthOrbitY,
+        Math.sin(earthOrbitStartAngle) * earthOrbitRadius,
+      );
+      windowEarthGroup.userData.orbitRadius = earthOrbitRadius;
+      windowEarthGroup.userData.orbitStartAngle = earthOrbitStartAngle;
+      windowEarthGroup.userData.orbitY = earthOrbitY;
+      windowEarthGroup.userData.orbitSpeed = 0.0095;
+
+      const windowEarthFill = new THREE.PointLight("#ffffff", 0.85, 34, 2);
+      windowEarthFill.position.set(5.4, 1.6, 1.4);
+      windowEarthGroup.add(windowEarthFill);
+
+      ship.add(windowEarthGroup);
+    }
+
+    ship.add(windowGroup);
+  };
+
+  createSideWallWindow(Math.PI, true);
+  createSideWallWindow(0);
 
   return ship;
 }
@@ -981,6 +1219,7 @@ function createFloatingWallSymbols(): {
 function enableProceduralLimbMotion(
   root: THREE.Object3D,
   timeUniforms: Array<{ value: number }>,
+  headTrackYawUniforms: Array<{ value: number }>,
   headNoUniforms: Array<{ value: number }>,
   headYesUniforms: Array<{ value: number }>,
   armTalkUniforms: Array<{ value: number }>,
@@ -1010,11 +1249,13 @@ function enableProceduralLimbMotion(
       const stdMat = material as THREE.MeshStandardMaterial;
       const clonedMaterial = stdMat.clone();
       const uLimbTime = { value: 0 };
+      const uHeadTrackYaw = { value: 0 };
       const uHeadNo = { value: 0 };
       const uHeadYes = { value: 0 };
       const uArmTalk = { value: 0 };
       const uHeadTalk = { value: 0 };
       timeUniforms.push(uLimbTime);
+      headTrackYawUniforms.push(uHeadTrackYaw);
       headNoUniforms.push(uHeadNo);
       headYesUniforms.push(uHeadYes);
       armTalkUniforms.push(uArmTalk);
@@ -1022,6 +1263,7 @@ function enableProceduralLimbMotion(
 
       clonedMaterial.onBeforeCompile = (shader) => {
         shader.uniforms.uLimbTime = uLimbTime;
+        shader.uniforms.uHeadTrackYaw = uHeadTrackYaw;
         shader.uniforms.uHeadNo = uHeadNo;
         shader.uniforms.uHeadYes = uHeadYes;
         shader.uniforms.uArmTalk = uArmTalk;
@@ -1035,6 +1277,7 @@ function enableProceduralLimbMotion(
             "#include <common>",
             `#include <common>
 uniform float uLimbTime;
+uniform float uHeadTrackYaw;
 uniform float uHeadNo;
 uniform float uHeadYes;
 uniform float uArmTalk;
@@ -1053,7 +1296,18 @@ uniform float uHalfWidth;`,
 float nYNorm = clamp((position.y - uMinY) / uHeight, 0.0, 1.0);
 float nXNorm = clamp((position.x + uHalfWidth) / (uHalfWidth * 2.0), 0.0, 1.0);
 
-float nTopMask = pow(smoothstep(0.73, 0.84, nYNorm), 3.2);
+float nTopMask = pow(smoothstep(0.71, 0.82, nYNorm), 3.2);
+float nTrackAngle = uHeadTrackYaw;
+float nTrackCos = cos(nTrackAngle);
+float nTrackSin = sin(nTrackAngle);
+vec2 nTopTrackLocal = vec2(objectNormal.x, objectNormal.z);
+vec2 nTopTrackRotated = vec2(
+  nTopTrackLocal.x * nTrackCos - nTopTrackLocal.y * nTrackSin,
+  nTopTrackLocal.x * nTrackSin + nTopTrackLocal.y * nTrackCos
+);
+objectNormal.x = mix(objectNormal.x, nTopTrackRotated.x, nTopMask);
+objectNormal.z = mix(objectNormal.z, nTopTrackRotated.y, nTopMask);
+
 float nNoAngle = uHeadNo;
 float nNoCos = cos(nNoAngle);
 float nNoSin = sin(nNoAngle);
@@ -1127,13 +1381,23 @@ float yNorm = clamp((position.y - uMinY) / uHeight, 0.0, 1.0);
 float xNorm = clamp((position.x + uHalfWidth) / (uHalfWidth * 2.0), 0.0, 1.0);
 
 float bodyMask = smoothstep(0.08, 0.72, yNorm) * (1.0 - smoothstep(0.74, 0.87, yNorm));
-float breathing = sin(uLimbTime * 1.785 + 1.2);
 float breathingLift = sin(uLimbTime * 1.785 + 0.25);
 
-transformed.z += bodyMask * breathing * (uHeight * 0.018);
 transformed.y += bodyMask * breathingLift * (uHeight * 0.0075);
 
-float topMask = pow(smoothstep(0.73, 0.84, yNorm), 3.2);
+float topMask = pow(smoothstep(0.71, 0.82, yNorm), 3.2);
+float trackAngle = uHeadTrackYaw;
+float trackCos = cos(trackAngle);
+float trackSin = sin(trackAngle);
+vec2 topTrackLocal = vec2(transformed.x, transformed.z);
+vec2 topTrackRotated = vec2(
+  topTrackLocal.x * trackCos - topTrackLocal.y * trackSin,
+  topTrackLocal.x * trackSin + topTrackLocal.y * trackCos
+);
+
+transformed.x = mix(transformed.x, topTrackRotated.x, topMask);
+transformed.z = mix(transformed.z, topTrackRotated.y, topMask);
+
 float noAngle = uHeadNo;
 float pivotY = uMinY + uHeight * 0.75;
 
@@ -1243,6 +1507,8 @@ export default function App() {
   const [endingFlashOpacity, setEndingFlashOpacity] = useState(0);
   const [endingPanelVisible, setEndingPanelVisible] = useState(false);
   const [masterVolume, setMasterVolume] = useState(50);
+  const [isHelpOpen, setIsHelpOpen] = useState(false);
+  const [isVolumeOpen, setIsVolumeOpen] = useState(false);
   const isDevBuild = import.meta.env.DEV;
   const voiceEnabled = true;
   const humAudioContextRef = useRef<AudioContext | null>(null);
@@ -1250,6 +1516,10 @@ export default function App() {
   const humOutputGainRef = useRef<GainNode | null>(null);
   const turbulenceTimerRef = useRef<number | null>(null);
   const buttonClickAudioRef = useRef<HTMLAudioElement | null>(null);
+  const flickerZapAudioRef = useRef<HTMLAudioElement | null>(null);
+  const flickerZapStopTimeoutRef = useRef<number | null>(null);
+  const noBeepAudioRef = useRef<HTMLAudioElement | null>(null);
+  const yesEchoAudioRef = useRef<HTMLAudioElement | null>(null);
   const revealAudioRef = useRef<HTMLAudioElement | null>(null);
   const revealAudioStartedRef = useRef(false);
   const darkHorrorAmbientAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -1265,6 +1535,13 @@ export default function App() {
   const buildupAudioRef = useRef<HTMLAudioElement | null>(null);
   const buildupGainRef = useRef(0);
   const buildupFadeFrameRef = useRef<number | null>(null);
+  const shakingShipAudioRef = useRef<HTMLAudioElement | null>(null);
+  const shakingShipGainRef = useRef(0);
+  const shakingShipFadeFrameRef = useRef<number | null>(null);
+  const shakingShipStopTimeoutRef = useRef<number | null>(null);
+  const fallingShipAudioRef = useRef<HTMLAudioElement | null>(null);
+  const fallingShipGainRef = useRef(0);
+  const fallingShipFadeFrameRef = useRef<number | null>(null);
   const endingBlackoutOpacityRef = useRef(0);
   const endingFlashOpacityRef = useRef(0);
   const endingPanelVisibleRef = useRef(false);
@@ -1285,6 +1562,8 @@ export default function App() {
   const spokenTurnRef = useRef<number | null>(null);
   const speechVoiceRef = useRef<SpeechSynthesisVoice | null>(null);
   const speechDelayTimeoutRef = useRef<number | null>(null);
+  const endingEchoTimeoutRef = useRef<number | null>(null);
+  const endingEchoPlayedRef = useRef(false);
   const speechQueueTokenRef = useRef(0);
   const speechAudioLayersRef = useRef<ActiveSpeechLayer[]>([]);
   const speechAbortControllersRef = useRef<AbortController[]>([]);
@@ -1707,49 +1986,38 @@ export default function App() {
   }, []);
 
   const playFlickerZapOneShot = useCallback(() => {
-    const context = humAudioContextRef.current;
-    const outputGain = humOutputGainRef.current;
-
-    if (!context || !outputGain || context.state !== "running") {
+    const flickerZap = flickerZapAudioRef.current;
+    if (!flickerZap) {
       return;
     }
 
-    const now = context.currentTime;
-
-    const sskSource = context.createBufferSource();
-    const sskBuffer = context.createBuffer(1, Math.floor(context.sampleRate * 0.028), context.sampleRate);
-    const sskData = sskBuffer.getChannelData(0);
-
-    for (let i = 0; i < sskData.length; i++) {
-      const progress = i / sskData.length;
-      const envelope = Math.exp(-progress * 8.8);
-      sskData[i] = (Math.random() * 2 - 1) * envelope;
+    if (flickerZapStopTimeoutRef.current !== null) {
+      window.clearTimeout(flickerZapStopTimeoutRef.current);
+      flickerZapStopTimeoutRef.current = null;
     }
 
-    sskSource.buffer = sskBuffer;
+    const clipDuration = FLICKER_ZAP_SLICE_SECONDS;
+    const hasDuration = Number.isFinite(flickerZap.duration) && flickerZap.duration > clipDuration;
+    const clipStart = hasDuration ? Math.max(0, flickerZap.duration * 0.5 - clipDuration * 0.5) : 0.35;
 
-    const sskHighpass = context.createBiquadFilter();
-    sskHighpass.type = "highpass";
-    sskHighpass.frequency.setValueAtTime(2100 + Math.random() * 500, now);
+    try {
+      flickerZap.pause();
+      flickerZap.currentTime = clipStart;
+      flickerZap.volume = clamp(masterVolumeRef.current * FLICKER_ZAP_VOLUME_SCALE, 0, 1);
+      const playAttempt = flickerZap.play();
+      if (playAttempt && typeof playAttempt.then === "function") {
+        void playAttempt.catch(() => {
+          return;
+        });
+      }
 
-    const sskBandpass = context.createBiquadFilter();
-    sskBandpass.type = "bandpass";
-    sskBandpass.frequency.setValueAtTime(3300 + Math.random() * 800, now);
-    sskBandpass.Q.value = 1.35;
-
-    const sskGain = context.createGain();
-    const baseLevel = 0.016 + Math.random() * 0.005;
-    sskGain.gain.setValueAtTime(0.0001, now);
-    sskGain.gain.exponentialRampToValueAtTime(baseLevel, now + 0.0015);
-    sskGain.gain.exponentialRampToValueAtTime(0.0001, now + 0.028);
-
-    sskSource.connect(sskHighpass);
-    sskHighpass.connect(sskBandpass);
-    sskBandpass.connect(sskGain);
-    sskGain.connect(outputGain);
-
-    sskSource.start(now);
-    sskSource.stop(now + 0.03);
+      flickerZapStopTimeoutRef.current = window.setTimeout(() => {
+        flickerZap.pause();
+        flickerZapStopTimeoutRef.current = null;
+      }, clipDuration * 1000);
+    } catch {
+      return;
+    }
   }, []);
 
   const playAlienAirwaveOneShot = useCallback(() => {
@@ -1858,10 +2126,49 @@ export default function App() {
     const now = performance.now();
     headReactionStartedAtRef.current = now;
 
+    const playNoShakeSound = () => {
+      const noBeep = noBeepAudioRef.current;
+      if (!noBeep) return;
+
+      try {
+        noBeep.pause();
+        noBeep.currentTime = HEAD_SHAKE_NO_TRIM_SECONDS;
+        noBeep.volume = clamp(masterVolumeRef.current * HEAD_SHAKE_NO_VOLUME_SCALE, 0, 1);
+        const playAttempt = noBeep.play();
+        if (playAttempt && typeof playAttempt.then === "function") {
+          void playAttempt.catch(() => {
+            return;
+          });
+        }
+      } catch {
+        return;
+      }
+    };
+
+    const playYesShakeSound = () => {
+      const yesEcho = yesEchoAudioRef.current;
+      if (!yesEcho) return;
+
+      try {
+        yesEcho.pause();
+        yesEcho.currentTime = 0;
+        yesEcho.volume = clamp(masterVolumeRef.current * HEAD_SHAKE_YES_VOLUME_SCALE, 0, 1);
+        const playAttempt = yesEcho.play();
+        if (playAttempt && typeof playAttempt.then === "function") {
+          void playAttempt.catch(() => {
+            return;
+          });
+        }
+      } catch {
+        return;
+      }
+    };
+
     if (delta > 0) {
       headReactionModeRef.current = "no";
       headJoltEndsAtRef.current = now + 420;
       headJoltDirectionRef.current = Math.random() < 0.5 ? -1 : 1;
+      playNoShakeSound();
       return;
     }
 
@@ -1869,6 +2176,7 @@ export default function App() {
       headReactionModeRef.current = "yes";
       headJoltEndsAtRef.current = now + 960;
       headJoltDirectionRef.current = 1;
+      playYesShakeSound();
       return;
     }
 
@@ -2241,6 +2549,147 @@ export default function App() {
     [applyBuildupVolume],
   );
 
+  const applyShakingShipVolume = useCallback(() => {
+    const shakingShip = shakingShipAudioRef.current;
+    if (!shakingShip) {
+      return;
+    }
+
+    shakingShip.volume = clamp(masterVolumeRef.current * SHAKING_SHIP_VOLUME_SCALE * shakingShipGainRef.current, 0, 1);
+  }, []);
+
+  const fadeShakingShipTo = useCallback(
+    (targetGain: number, durationMs: number, onComplete?: () => void) => {
+      const target = clamp(targetGain, 0, 1);
+      const start = shakingShipGainRef.current;
+
+      if (shakingShipFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(shakingShipFadeFrameRef.current);
+        shakingShipFadeFrameRef.current = null;
+      }
+
+      if (durationMs <= 0 || Math.abs(target - start) < 0.0001) {
+        shakingShipGainRef.current = target;
+        applyShakingShipVolume();
+        if (onComplete) onComplete();
+        return;
+      }
+
+      const startTime = performance.now();
+      const animateFade = () => {
+        const elapsedMs = performance.now() - startTime;
+        const t = clamp(elapsedMs / durationMs, 0, 1);
+        const eased = 1 - Math.pow(1 - t, 2);
+        shakingShipGainRef.current = THREE.MathUtils.lerp(start, target, eased);
+        applyShakingShipVolume();
+
+        if (t < 1) {
+          shakingShipFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+          return;
+        }
+
+        shakingShipFadeFrameRef.current = null;
+        if (onComplete) onComplete();
+      };
+
+      shakingShipFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+    },
+    [applyShakingShipVolume],
+  );
+
+  const playShakingShipCue = useCallback(() => {
+    const shakingShip = shakingShipAudioRef.current;
+    if (!shakingShip) {
+      return;
+    }
+
+    if (shakingShipStopTimeoutRef.current !== null) {
+      window.clearTimeout(shakingShipStopTimeoutRef.current);
+      shakingShipStopTimeoutRef.current = null;
+    }
+
+    try {
+      shakingShip.pause();
+      shakingShip.currentTime = 0;
+    } catch {
+      return;
+    }
+
+    shakingShipGainRef.current = 0;
+    applyShakingShipVolume();
+
+    const playAttempt = shakingShip.play();
+    const startFades = () => {
+      fadeShakingShipTo(1, 520);
+      shakingShipStopTimeoutRef.current = window.setTimeout(() => {
+        fadeShakingShipTo(0, 260, () => {
+          shakingShip.pause();
+          shakingShip.currentTime = 0;
+        });
+        shakingShipStopTimeoutRef.current = null;
+      }, 1000);
+    };
+
+    if (playAttempt && typeof playAttempt.then === "function") {
+      void playAttempt
+        .then(() => {
+          startFades();
+        })
+        .catch(() => {
+          return;
+        });
+      return;
+    }
+
+    startFades();
+  }, [applyShakingShipVolume, fadeShakingShipTo]);
+
+  const applyFallingShipVolume = useCallback(() => {
+    const fallingShip = fallingShipAudioRef.current;
+    if (!fallingShip) {
+      return;
+    }
+
+    fallingShip.volume = clamp(masterVolumeRef.current * FALLING_SHIP_VOLUME_SCALE * fallingShipGainRef.current, 0, 1);
+  }, []);
+
+  const fadeFallingShipTo = useCallback(
+    (targetGain: number, durationMs: number) => {
+      const target = clamp(targetGain, 0, 1);
+      const start = fallingShipGainRef.current;
+
+      if (fallingShipFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(fallingShipFadeFrameRef.current);
+        fallingShipFadeFrameRef.current = null;
+      }
+
+      if (durationMs <= 0 || Math.abs(target - start) < 0.0001) {
+        fallingShipGainRef.current = target;
+        applyFallingShipVolume();
+        return;
+      }
+
+      const startTime = performance.now();
+      const animateFade = () => {
+        const elapsedMs = performance.now() - startTime;
+        const t = clamp(elapsedMs / durationMs, 0, 1);
+        const eased = 1 - Math.pow(1 - t, 2);
+        fallingShipGainRef.current = THREE.MathUtils.lerp(start, target, eased);
+        applyFallingShipVolume();
+
+        if (t < 1) {
+          fallingShipFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+          return;
+        }
+
+        fallingShipFadeFrameRef.current = null;
+      };
+
+      fallingShipFadeFrameRef.current = window.requestAnimationFrame(animateFade);
+    },
+    [applyFallingShipVolume],
+  );
+
   useEffect(() => {
     const normalized = Math.max(0, Math.min(1, masterVolume / 100));
     masterVolumeRef.current = normalized;
@@ -2263,6 +2712,18 @@ export default function App() {
       buttonClickAudioRef.current.volume = Math.min(1, normalized * 0.9);
     }
 
+    if (flickerZapAudioRef.current) {
+      flickerZapAudioRef.current.volume = clamp(normalized * FLICKER_ZAP_VOLUME_SCALE, 0, 1);
+    }
+
+    if (noBeepAudioRef.current) {
+      noBeepAudioRef.current.volume = clamp(normalized * HEAD_SHAKE_NO_VOLUME_SCALE, 0, 1);
+    }
+
+    if (yesEchoAudioRef.current) {
+      yesEchoAudioRef.current.volume = clamp(normalized * HEAD_SHAKE_YES_VOLUME_SCALE, 0, 1);
+    }
+
     if (revealAudioRef.current && !isRevealingRef.current) {
       revealAudioRef.current.volume = Math.min(1, normalized * 0.42);
     }
@@ -2271,6 +2732,8 @@ export default function App() {
     applyOceanAmbienceVolume();
     applyEndMusicVolume();
     applyBuildupVolume();
+    applyShakingShipVolume();
+    applyFallingShipVolume();
 
     if (distantExplosionAudioRef.current) {
       distantExplosionAudioRef.current.volume = clamp(normalized * DISTANT_EXPLOSION_VOLUME_SCALE, 0, 1);
@@ -2285,7 +2748,9 @@ export default function App() {
     applyBuildupVolume,
     applyDarkHorrorAmbientVolume,
     applyEndMusicVolume,
+    applyFallingShipVolume,
     applyOceanAmbienceVolume,
+    applyShakingShipVolume,
     masterVolume,
   ]);
 
@@ -2294,6 +2759,24 @@ export default function App() {
     clickAudio.preload = "auto";
     clickAudio.volume = Math.min(1, masterVolumeRef.current * 0.9);
     buttonClickAudioRef.current = clickAudio;
+
+    const flickerZap = new Audio("/lightflicker.mp3");
+    flickerZap.preload = "auto";
+    flickerZap.loop = false;
+    flickerZap.volume = clamp(masterVolumeRef.current * FLICKER_ZAP_VOLUME_SCALE, 0, 1);
+    flickerZapAudioRef.current = flickerZap;
+
+    const noBeep = new Audio("/nobeep.mp3");
+    noBeep.preload = "auto";
+    noBeep.loop = false;
+    noBeep.volume = clamp(masterVolumeRef.current * HEAD_SHAKE_NO_VOLUME_SCALE, 0, 1);
+    noBeepAudioRef.current = noBeep;
+
+    const yesEcho = new Audio("/yesecho.mp3");
+    yesEcho.preload = "auto";
+    yesEcho.loop = false;
+    yesEcho.volume = clamp(masterVolumeRef.current * HEAD_SHAKE_YES_VOLUME_SCALE, 0, 1);
+    yesEchoAudioRef.current = yesEcho;
 
     const revealAudio = new Audio("/horrorLoad.mp3");
     revealAudio.preload = "auto";
@@ -2347,9 +2830,42 @@ export default function App() {
     buildupAudioRef.current = buildup;
     applyBuildupVolume();
 
+    const shakingShip = new Audio("/shakingship.mp3");
+    shakingShip.preload = "auto";
+    shakingShip.loop = false;
+    shakingShip.currentTime = 0;
+    shakingShipGainRef.current = 0;
+    shakingShipAudioRef.current = shakingShip;
+    applyShakingShipVolume();
+
+    const fallingShip = new Audio("/fallingship.mp3");
+    fallingShip.preload = "auto";
+    fallingShip.loop = true;
+    fallingShip.currentTime = 0;
+    fallingShipGainRef.current = 0;
+    fallingShipAudioRef.current = fallingShip;
+    applyFallingShipVolume();
+
     return () => {
       clickAudio.pause();
       buttonClickAudioRef.current = null;
+
+      if (flickerZapStopTimeoutRef.current !== null) {
+        window.clearTimeout(flickerZapStopTimeoutRef.current);
+        flickerZapStopTimeoutRef.current = null;
+      }
+      flickerZap.pause();
+      flickerZap.currentTime = 0;
+      flickerZapAudioRef.current = null;
+
+      noBeep.pause();
+      noBeep.currentTime = 0;
+      noBeepAudioRef.current = null;
+
+      yesEcho.pause();
+      yesEcho.currentTime = 0;
+      yesEchoAudioRef.current = null;
+
       revealAudio.pause();
       revealAudioRef.current = null;
 
@@ -2376,6 +2892,18 @@ export default function App() {
       buildup.currentTime = 0;
       buildupAudioRef.current = null;
 
+      if (shakingShipStopTimeoutRef.current !== null) {
+        window.clearTimeout(shakingShipStopTimeoutRef.current);
+        shakingShipStopTimeoutRef.current = null;
+      }
+      shakingShip.pause();
+      shakingShip.currentTime = 0;
+      shakingShipAudioRef.current = null;
+
+      fallingShip.pause();
+      fallingShip.currentTime = 0;
+      fallingShipAudioRef.current = null;
+
       if (darkHorrorAmbientFadeFrameRef.current !== null) {
         window.cancelAnimationFrame(darkHorrorAmbientFadeFrameRef.current);
         darkHorrorAmbientFadeFrameRef.current = null;
@@ -2395,12 +2923,24 @@ export default function App() {
         window.cancelAnimationFrame(buildupFadeFrameRef.current);
         buildupFadeFrameRef.current = null;
       }
+
+      if (shakingShipFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(shakingShipFadeFrameRef.current);
+        shakingShipFadeFrameRef.current = null;
+      }
+
+      if (fallingShipFadeFrameRef.current !== null) {
+        window.cancelAnimationFrame(fallingShipFadeFrameRef.current);
+        fallingShipFadeFrameRef.current = null;
+      }
     };
   }, [
     applyBuildupVolume,
     applyDarkHorrorAmbientVolume,
     applyEndMusicVolume,
+    applyFallingShipVolume,
     applyOceanAmbienceVolume,
+    applyShakingShipVolume,
     restartDarkHorrorAmbientWithFade,
   ]);
 
@@ -2447,6 +2987,83 @@ export default function App() {
       window.speechSynthesis.removeEventListener("voiceschanged", syncVoice);
     };
   }, [speechSupported]);
+
+  useEffect(() => {
+    const shouldPlayEndingSpeech = speechSupported && phase === "ending" && endingPanelVisible;
+    const isSavedOutcome = endingSavedOutcomeRef.current;
+
+    if (!shouldPlayEndingSpeech) {
+      if (endingEchoTimeoutRef.current !== null) {
+        window.clearTimeout(endingEchoTimeoutRef.current);
+        endingEchoTimeoutRef.current = null;
+      }
+
+      if (phase !== "ending") {
+        endingEchoPlayedRef.current = false;
+      }
+      return;
+    }
+
+    if (endingEchoPlayedRef.current) {
+      return;
+    }
+
+    endingEchoPlayedRef.current = true;
+    window.speechSynthesis.cancel();
+
+    const lead = new SpeechSynthesisUtterance(
+      isSavedOutcome ? "Earth.. may.. continue" : "Earth.. has failed.. the protocol",
+    );
+    lead.voice = speechVoiceRef.current;
+    lead.lang = speechVoiceRef.current?.lang ?? "en-US";
+    lead.rate = isSavedOutcome ? 0.6 : 0.48;
+    lead.pitch = isSavedOutcome ? 0.08 : 0.01;
+    lead.volume = clamp(masterVolumeRef.current * (isSavedOutcome ? 0.16 : 0.2), 0.02, 0.24);
+
+    lead.onend = () => {
+      if (!isSavedOutcome) {
+        return;
+      }
+
+      if (endingEchoTimeoutRef.current !== null) {
+        window.clearTimeout(endingEchoTimeoutRef.current);
+      }
+
+      endingEchoTimeoutRef.current = window.setTimeout(() => {
+        endingEchoTimeoutRef.current = null;
+
+        if (
+          !speechSupported ||
+          phaseRef.current !== "ending" ||
+          !endingPanelVisibleRef.current ||
+          !endingSavedOutcomeRef.current
+        ) {
+          return;
+        }
+
+        const echo = new SpeechSynthesisUtterance("Earth.. may.. continue");
+        echo.voice = speechVoiceRef.current;
+        echo.lang = speechVoiceRef.current?.lang ?? "en-US";
+        echo.rate = 0.56;
+        echo.pitch = 0.02;
+        echo.volume = clamp(masterVolumeRef.current * 0.07, 0.01, 0.09);
+        window.speechSynthesis.speak(echo);
+      }, 300);
+    };
+
+    lead.onerror = () => {
+      return;
+    };
+
+    window.speechSynthesis.speak(lead);
+
+    return () => {
+      if (endingEchoTimeoutRef.current !== null) {
+        window.clearTimeout(endingEchoTimeoutRef.current);
+        endingEchoTimeoutRef.current = null;
+      }
+    };
+  }, [speechSupported, phase, endingPanelVisible]);
 
   const handleGlobalButtonClick = (event: React.MouseEvent<HTMLElement>) => {
     const target = event.target as HTMLElement | null;
@@ -2807,7 +3424,7 @@ export default function App() {
 
     const scene = new THREE.Scene();
     const introBackgroundColor = new THREE.Color("#010102");
-    const gameplayBackgroundColor = new THREE.Color("#05070c");
+    const gameplayBackgroundColor = new THREE.Color("#020309");
     const introFog = new THREE.Fog("#010102", 6.4, 17.5);
     const gameplayFog = new THREE.Fog("#05070c", 4.8, 15.5);
     scene.background = introBackgroundColor;
@@ -2825,6 +3442,8 @@ export default function App() {
     const ship = createSpaceshipInterior();
     scene.add(ship);
     ship.visible = false;
+    const deepSpaceStars = ship.getObjectByName("deep-space-stars") as THREE.Points | null;
+    const leftWindowEarth = ship.getObjectByName("left-window-earth") as THREE.Group | null;
 
     const {
       group: wallSymbolGroup,
@@ -2837,6 +3456,7 @@ export default function App() {
     const introEarthGroup = new THREE.Group();
     const introEarthCenter = new THREE.Vector3(0, 1.48, -3.7);
     let introEarthModel: THREE.Object3D | null = null;
+    let leftWindowEarthModel: THREE.Object3D | null = null;
     let introUfoModel: THREE.Object3D | null = null;
     const earth = new THREE.Mesh(
       new THREE.IcosahedronGeometry(1.32, 1),
@@ -2965,6 +3585,26 @@ export default function App() {
     const introEarthLoader = new GLTFLoader();
     const introEarthModelCandidates = ["/models/low_poly_earth.glb", "/models/earth.glb"];
 
+    const applyEarthMaterialTuning = (material: THREE.Material) => {
+      if (material instanceof THREE.MeshStandardMaterial || material instanceof THREE.MeshPhysicalMaterial) {
+        const materialName = material.name.toLowerCase();
+
+        if (materialName.includes("water")) {
+          material.color = new THREE.Color("#34557e");
+          material.roughness = 0.95;
+          material.metalness = 0;
+        } else if (materialName.includes("earth")) {
+          material.color = new THREE.Color("#4f5542");
+          material.roughness = 0.99;
+          material.metalness = 0;
+        }
+
+        material.roughness = Math.min(1, Math.max(0, material.roughness ?? 0.8));
+        material.metalness = Math.min(1, Math.max(0, material.metalness ?? 0.05));
+        material.emissiveIntensity = 0;
+      }
+    };
+
     const loadIntroEarthModel = (candidateIndex: number) => {
       if (candidateIndex >= introEarthModelCandidates.length) {
         introEarthModel = null;
@@ -2998,35 +3638,110 @@ export default function App() {
           mesh.castShadow = false;
           mesh.receiveShadow = false;
 
-          const applyTuning = (material: THREE.Material) => {
-            if (material instanceof THREE.MeshStandardMaterial || material instanceof THREE.MeshPhysicalMaterial) {
-              const materialName = material.name.toLowerCase();
-
-              if (materialName.includes("water")) {
-                material.color = new THREE.Color("#34557e");
-                material.roughness = 0.95;
-                material.metalness = 0;
-              } else if (materialName.includes("earth")) {
-                material.color = new THREE.Color("#4f5542");
-                material.roughness = 0.99;
-                material.metalness = 0;
-              }
-
-              material.roughness = Math.min(1, Math.max(0, material.roughness ?? 0.8));
-              material.metalness = Math.min(1, Math.max(0, material.metalness ?? 0.05));
-              material.emissiveIntensity = 0;
-            }
-          };
-
           if (Array.isArray(mesh.material)) {
-            mesh.material.forEach((material) => applyTuning(material));
+            mesh.material.forEach((material) => applyEarthMaterialTuning(material));
           } else if (mesh.material) {
-            applyTuning(mesh.material);
+            applyEarthMaterialTuning(mesh.material);
           }
         });
 
           introEarthGroup.visible = false;
           scene.add(introEarthModel);
+
+          if (leftWindowEarth) {
+            if (leftWindowEarthModel) {
+              leftWindowEarth.remove(leftWindowEarthModel);
+            }
+
+            leftWindowEarthModel = introEarthModel.clone(true);
+
+            const windowBounds = new THREE.Box3().setFromObject(leftWindowEarthModel);
+            const windowSize = new THREE.Vector3();
+            const windowCenter = new THREE.Vector3();
+            windowBounds.getSize(windowSize);
+            windowBounds.getCenter(windowCenter);
+
+            const windowLongestAxis = Math.max(windowSize.x, windowSize.y, windowSize.z, 0.0001);
+            const windowTargetDiameter = 13.2;
+            const windowFitScale = windowTargetDiameter / windowLongestAxis;
+            leftWindowEarthModel.scale.setScalar(windowFitScale);
+
+            windowBounds.setFromObject(leftWindowEarthModel);
+            windowBounds.getCenter(windowCenter);
+            leftWindowEarthModel.position.set(-windowCenter.x, -windowCenter.y, -windowCenter.z);
+
+            leftWindowEarthModel.traverse((object) => {
+              const mesh = object as THREE.Mesh;
+              if (!mesh.isMesh) return;
+              mesh.castShadow = false;
+              mesh.receiveShadow = false;
+
+              if (Array.isArray(mesh.material)) {
+                mesh.material = mesh.material.map((material) => {
+                  if (material instanceof THREE.MeshStandardMaterial || material instanceof THREE.MeshPhysicalMaterial) {
+                    const materialName = material.name.toLowerCase();
+                    const tuned = material.clone();
+                    tuned.fog = false;
+                    if (materialName.includes("earth") || materialName.includes("land")) {
+                      tuned.color = new THREE.Color("#5d7b48");
+                    }
+                    tuned.roughness = Math.max(0.92, tuned.roughness ?? 0.92);
+                    tuned.metalness = 0;
+                    tuned.envMapIntensity = 0.12;
+                    if (tuned instanceof THREE.MeshPhysicalMaterial) {
+                      tuned.clearcoat = 0;
+                      tuned.clearcoatRoughness = 1;
+                      tuned.sheen = 0;
+                      tuned.transmission = 0;
+                      tuned.ior = 1.2;
+                    }
+                    if (tuned.map) {
+                      tuned.emissive = new THREE.Color("#ffffff");
+                      tuned.emissiveMap = tuned.map;
+                      tuned.emissiveIntensity = 0.07;
+                    } else {
+                      tuned.emissive = tuned.color.clone();
+                      tuned.emissiveMap = null;
+                      tuned.emissiveIntensity = 0.04;
+                    }
+                    return tuned;
+                  }
+                  return material;
+                });
+              } else if (mesh.material) {
+                if (mesh.material instanceof THREE.MeshStandardMaterial || mesh.material instanceof THREE.MeshPhysicalMaterial) {
+                  const materialName = mesh.material.name.toLowerCase();
+                  const tuned = mesh.material.clone();
+                  tuned.fog = false;
+                  if (materialName.includes("earth") || materialName.includes("land")) {
+                    tuned.color = new THREE.Color("#5d7b48");
+                  }
+                  tuned.roughness = Math.max(0.92, tuned.roughness ?? 0.92);
+                  tuned.metalness = 0;
+                  tuned.envMapIntensity = 0.12;
+                  if (tuned instanceof THREE.MeshPhysicalMaterial) {
+                    tuned.clearcoat = 0;
+                    tuned.clearcoatRoughness = 1;
+                    tuned.sheen = 0;
+                    tuned.transmission = 0;
+                    tuned.ior = 1.2;
+                  }
+                  if (tuned.map) {
+                    tuned.emissive = new THREE.Color("#ffffff");
+                    tuned.emissiveMap = tuned.map;
+                    tuned.emissiveIntensity = 0.07;
+                  } else {
+                    tuned.emissive = tuned.color.clone();
+                    tuned.emissiveMap = null;
+                    tuned.emissiveIntensity = 0.04;
+                  }
+                  mesh.material = tuned;
+                }
+              }
+            });
+
+            leftWindowEarth.add(leftWindowEarthModel);
+          }
         },
         undefined,
         () => {
@@ -3077,7 +3792,7 @@ export default function App() {
     scene.add(ambient);
 
     const dimRim = new THREE.PointLight("#536f96", 0.14, 9, 2);
-    dimRim.position.set(0, 3.8, -4.6);
+    dimRim.position.set(0, 4.28, 0);
     scene.add(dimRim);
 
     const ceilingGlowDisc = new THREE.Mesh(
@@ -3094,46 +3809,75 @@ export default function App() {
     ceilingGlowDisc.rotation.x = Math.PI / 2;
     scene.add(ceilingGlowDisc);
 
-    const flashLight = new THREE.SpotLight("#c7c8cc", 8.2, 26, Math.PI * 0.125, 0.62, 1.22);
+    const ceilingGlowFrame = new THREE.Mesh(
+      new THREE.TorusGeometry(0.79, 0.04, 12, 64),
+      new THREE.MeshStandardMaterial({
+        color: "#7a828e",
+        roughness: 0.56,
+        metalness: 0.44,
+      }),
+    );
+    ceilingGlowFrame.position.set(0, 4.275, 0);
+    ceilingGlowFrame.rotation.x = Math.PI / 2;
+    scene.add(ceilingGlowFrame);
+
+    const flashLight = new THREE.SpotLight("#c7c8cc", 10.8, 54, Math.PI * 0.125, 0.62, 0.82);
     const flashLightTarget = new THREE.Object3D();
     scene.add(flashLight);
     scene.add(flashLightTarget);
     flashLight.target = flashLightTarget;
 
-    const flashFill = new THREE.PointLight("#c9c7bf", 0.24, 4, 1.9);
+    const flashFill = new THREE.PointLight("#c9c7bf", 0.2, 4, 1.9);
     scene.add(flashFill);
+
+    const ceilingCoreLight = new THREE.PointLight("#ffd46b", 0.8, 6.2, 2.15);
+    ceilingCoreLight.position.set(0, 3.62, 0);
+    scene.add(ceilingCoreLight);
 
     const baseAmbientIntensity = 0.08;
     const baseDimRimIntensity = 0.14;
-    const baseFlashIntensity = 8.2;
-    const baseFlashFillIntensity = 0.24;
+    const baseFlashIntensity = 10.8;
+    const baseFlashFillIntensity = 0.2;
     const baseCeilingEmissiveIntensity = 2.4;
+    const baseCeilingCoreLightIntensity = 0.8;
     const baseAmbientColor = new THREE.Color("#233754");
     const baseDimRimColor = new THREE.Color("#536f96");
     const baseFlashColor = new THREE.Color("#c7c8cc");
     const baseFlashFillColor = new THREE.Color("#c9c7bf");
     const baseCeilingEmissiveColor = new THREE.Color("#ffd46b");
+    const baseCeilingCoreLightColor = new THREE.Color("#ffd46b");
     const alertAmbientColor = new THREE.Color("#45141a");
     const alertDimRimColor = new THREE.Color("#8f1f2b");
     const alertFlashColor = new THREE.Color("#ff5d68");
     const alertFlashFillColor = new THREE.Color("#d8444f");
     const alertCeilingEmissiveColor = new THREE.Color("#ff2b3e");
+    const alertCeilingCoreLightColor = new THREE.Color("#ff2b3e");
+    const affirmAmbientColor = new THREE.Color("#1a2742");
+    const affirmDimRimColor = new THREE.Color("#2d4f8a");
+    const affirmFlashColor = new THREE.Color("#6b97ff");
+    const affirmFlashFillColor = new THREE.Color("#4f75c4");
     const ceilingGlowMaterial = ceilingGlowDisc.material as THREE.MeshStandardMaterial;
     let roomFlickerPulse = 1;
     let roomFlickerPulseTime = 0;
     let roomFlickerTimer = 0;
+    let queuedDoubleFlickerAt = 0;
     let finalQuestionDimLevel = 0;
     let wallSymbolVisibility = 0;
 
     ambient.visible = false;
     dimRim.visible = false;
     ceilingGlowDisc.visible = false;
+    ceilingGlowFrame.visible = false;
     flashLight.visible = false;
     flashFill.visible = false;
+    ceilingCoreLight.visible = false;
 
     let alienRoot: THREE.Object3D | null = null;
+    let alienBodyYaw = 0;
+    let lastPlayerMoveAt = performance.now();
     const alienCollisionCenter = new THREE.Vector3(0, 0, 0);
     const alienLimbTimeUniforms: Array<{ value: number }> = [];
+    const alienHeadTrackYawUniforms: Array<{ value: number }> = [];
     const alienHeadNoUniforms: Array<{ value: number }> = [];
     const alienHeadYesUniforms: Array<{ value: number }> = [];
     const alienArmTalkUniforms: Array<{ value: number }> = [];
@@ -3171,11 +3915,13 @@ export default function App() {
         enableProceduralLimbMotion(
           alienRoot,
           alienLimbTimeUniforms,
+          alienHeadTrackYawUniforms,
           alienHeadNoUniforms,
           alienHeadYesUniforms,
           alienArmTalkUniforms,
           alienHeadTalkUniforms,
         );
+        alienBodyYaw = alienRoot.rotation.y;
         scene.add(alienRoot);
       },
       undefined,
@@ -3186,6 +3932,7 @@ export default function App() {
         );
         fallback.position.set(0, 1.2, 0);
         alienRoot = fallback;
+        alienBodyYaw = fallback.rotation.y;
         alienCollisionCenter.set(fallback.position.x, 0, fallback.position.z);
         scene.add(fallback);
       },
@@ -3211,6 +3958,11 @@ export default function App() {
     const alienCollisionRadius = 0.95;
     const tmpEuler = new THREE.Euler(0, 0, 0, "YXZ");
     const eyeHeight = 1.65;
+    const maxAlienHeadTrackYaw = THREE.MathUtils.degToRad(70);
+    const alienBodyRecenterPauseMs = 1500;
+    const alienBodyRecenterThreshold = THREE.MathUtils.degToRad(8);
+    const alienBodyFollowTurnSpeed = 2.45;
+    const alienBodyIdleRecenterSpeed = 1.75;
     let bobTime = 0;
     let bobOffset = 0;
     let bobIntensity = 0;
@@ -3268,6 +4020,9 @@ export default function App() {
     const introLookTarget = new THREE.Vector3(0, 1.47, -3.7);
     const ufoWorldPosition = new THREE.Vector3();
     let buildupActive = false;
+    let fallingShipActive = false;
+    let shakingShipCuePlayed = false;
+    let deepSpaceOrbitYaw = 0;
     let animationFrameId = 0;
 
     const animate = () => {
@@ -3303,8 +4058,10 @@ export default function App() {
         ambient.visible = false;
         dimRim.visible = false;
         ceilingGlowDisc.visible = false;
+        ceilingGlowFrame.visible = false;
         flashLight.visible = false;
         flashFill.visible = false;
+        ceilingCoreLight.visible = false;
         wallSymbolGroup.visible = false;
         if (alienRoot) alienRoot.visible = false;
 
@@ -3316,11 +4073,13 @@ export default function App() {
         flashLight.intensity = baseFlashIntensity;
         flashFill.intensity = baseFlashFillIntensity;
         ceilingGlowMaterial.emissiveIntensity = baseCeilingEmissiveIntensity;
+        ceilingCoreLight.intensity = baseCeilingCoreLightIntensity;
         ambient.color.copy(baseAmbientColor);
         dimRim.color.copy(baseDimRimColor);
         flashLight.color.copy(baseFlashColor);
         flashFill.color.copy(baseFlashFillColor);
         ceilingGlowMaterial.emissive.copy(baseCeilingEmissiveColor);
+        ceilingCoreLight.color.copy(baseCeilingCoreLightColor);
         endingExplosionFlash.visible = false;
         endingExplosionLight.intensity = 0;
         roomFlickerPulse = 1;
@@ -3360,6 +4119,29 @@ export default function App() {
         return;
       }
 
+      if (deepSpaceStars) {
+        deepSpaceOrbitYaw += delta * 0.006;
+        deepSpaceStars.rotation.y = deepSpaceOrbitYaw;
+        deepSpaceStars.rotation.x = 0.11 + Math.sin(elapsed * 0.009) * 0.012;
+        deepSpaceStars.rotation.z = -0.08 + Math.sin(elapsed * 0.0084 + 0.7) * 0.01;
+        deepSpaceStars.position.x = Math.sin(elapsed * 0.024) * 0.12;
+        deepSpaceStars.position.y = Math.sin(elapsed * 0.018 + 0.8) * 0.08;
+        deepSpaceStars.position.z = Math.sin(elapsed * 0.021 + 1.4) * 0.1;
+      }
+
+      if (leftWindowEarth) {
+        const orbitRadius = (leftWindowEarth.userData.orbitRadius as number | undefined) ?? 62;
+        const orbitStartAngle = (leftWindowEarth.userData.orbitStartAngle as number | undefined) ?? Math.PI;
+        const orbitY = (leftWindowEarth.userData.orbitY as number | undefined) ?? 2.41;
+        const orbitSpeed = (leftWindowEarth.userData.orbitSpeed as number | undefined) ?? 0.0066;
+        const orbitAngle = orbitStartAngle - elapsed * orbitSpeed;
+        leftWindowEarth.position.x = Math.cos(orbitAngle) * orbitRadius;
+        leftWindowEarth.position.z = Math.sin(orbitAngle) * orbitRadius;
+        leftWindowEarth.position.y = orbitY + Math.sin(elapsed * 0.0198 + 0.35) * 0.22;
+        leftWindowEarth.rotation.y += delta * 0.07;
+        leftWindowEarth.rotation.x = Math.sin(elapsed * 0.12) * 0.03;
+      }
+
       const endingMode = phaseRef.current === "ending";
       const endingSequence = endingCinematicRef.current;
       const endingSavedOutcome = endingSavedOutcomeRef.current;
@@ -3394,6 +4176,42 @@ export default function App() {
           }
         }
       }
+
+      if (shouldBuildupBeActive !== fallingShipActive) {
+        fallingShipActive = shouldBuildupBeActive;
+        const fallingShip = fallingShipAudioRef.current;
+        if (fallingShip) {
+          if (fallingShipActive) {
+            try {
+              fallingShip.currentTime = 0;
+            } catch {
+              fallingShip.currentTime = 0;
+            }
+            const playAttempt = fallingShip.play();
+            if (playAttempt && typeof playAttempt.then === "function") {
+              void playAttempt
+                .then(() => {
+                  fadeFallingShipTo(1, 1800);
+                })
+                .catch(() => {
+                  return;
+                });
+            } else {
+              fadeFallingShipTo(1, 1800);
+            }
+          } else {
+            fadeFallingShipTo(0, 650);
+          }
+        }
+      }
+
+      if (shouldBuildupBeActive && !shakingShipCuePlayed) {
+        shakingShipCuePlayed = true;
+        playShakingShipCue();
+      } else if (!shouldBuildupBeActive) {
+        shakingShipCuePlayed = false;
+      }
+
       const isEndingRoomStage = endingMode && (endingStage === "room-shake-flash" || endingStage === "fade-room-black");
       const isEndingWorldStage =
         endingMode &&
@@ -3426,6 +4244,7 @@ export default function App() {
           nextFlash = 0;
           nextBlackout = Math.min(1, nextBlackout + delta / 1.45);
           if (nextBlackout >= 0.995) {
+            void stopShipHum();
             endingSequence.stage = endingSavedOutcome ? "show-saved" : "show-destroyed-earth";
             endingSequence.stageStartedAt = now;
             endingSequence.blastStartedAt = 0;
@@ -3507,6 +4326,7 @@ export default function App() {
         ambient.visible = false;
         dimRim.visible = false;
         ceilingGlowDisc.visible = false;
+        ceilingGlowFrame.visible = false;
         flashLight.visible = false;
         flashFill.visible = false;
         wallSymbolGroup.visible = false;
@@ -3557,8 +4377,10 @@ export default function App() {
         ambient.visible = true;
         dimRim.visible = true;
         ceilingGlowDisc.visible = true;
+        ceilingGlowFrame.visible = true;
         flashLight.visible = true;
         flashFill.visible = true;
+        ceilingCoreLight.visible = true;
         wallSymbolGroup.visible = wallSymbolVisibility > 0.01;
         if (alienRoot) alienRoot.visible = true;
 
@@ -3569,10 +4391,21 @@ export default function App() {
       roomFlickerTimer -= delta;
       roomFlickerPulseTime = Math.max(0, roomFlickerPulseTime - delta);
 
+      const nowMs = performance.now();
+      if (queuedDoubleFlickerAt > 0 && nowMs >= queuedDoubleFlickerAt) {
+        roomFlickerPulse = 0.8 + Math.random() * 0.12;
+        roomFlickerPulseTime = 0.018 + Math.random() * 0.026;
+        queuedDoubleFlickerAt = 0;
+        playFlickerZapOneShot();
+      }
+
       if (roomFlickerTimer <= 0) {
+        const isLongFlicker = Math.random() < 0.3;
+        const isDoubleFlicker = Math.random() < 0.2;
         roomFlickerPulse = 0.78 + Math.random() * 0.14;
-        roomFlickerPulseTime = 0.022 + Math.random() * 0.035;
-        roomFlickerTimer = 1.2 + Math.random() * 2.6;
+        roomFlickerPulseTime = isLongFlicker ? 0.065 + Math.random() * 0.07 : 0.022 + Math.random() * 0.035;
+        roomFlickerTimer = 2.3 + Math.random() * 4.4;
+        queuedDoubleFlickerAt = isDoubleFlicker ? nowMs + 70 + Math.random() * 90 : 0;
         playFlickerZapOneShot();
       }
 
@@ -3614,6 +4447,18 @@ export default function App() {
       const dimLerp = 1 - Math.exp(-delta * (isFinalQuestionActive || isEndingRoomStage ? 1.1 : 3.4));
       finalQuestionDimLevel = THREE.MathUtils.lerp(finalQuestionDimLevel, dimTarget, dimLerp);
       const finalQuestionLightFactor = 1 - finalQuestionDimLevel * 0.52;
+      const headReactionNow = performance.now();
+      const headReactionMode = headReactionModeRef.current;
+      const headReactionDurationMs = Math.max(1, headJoltEndsAtRef.current - headReactionStartedAtRef.current);
+      const headReactionProgress = THREE.MathUtils.clamp(
+        (headReactionNow - headReactionStartedAtRef.current) / headReactionDurationMs,
+        0,
+        1,
+      );
+      const headReactionEnvelope =
+        headReactionNow < headJoltEndsAtRef.current ? Math.sin(headReactionProgress * Math.PI) : 0;
+      const isHeadNoReactionActive = headReactionEnvelope > 0 && headReactionMode === "no";
+      const isHeadYesReactionActive = headReactionEnvelope > 0 && headReactionMode === "yes";
 
       ambient.intensity = baseAmbientIntensity * roomLightFactor * finalQuestionLightFactor;
       dimRim.intensity = baseDimRimIntensity * roomLightFactor * finalQuestionLightFactor;
@@ -3621,12 +4466,15 @@ export default function App() {
       flashFill.intensity = baseFlashFillIntensity * roomLightFactor * finalQuestionLightFactor;
       ceilingGlowMaterial.emissiveIntensity =
         baseCeilingEmissiveIntensity * ceilingFlickerFactor * (1 - finalQuestionDimLevel * 0.66);
+      ceilingCoreLight.intensity =
+        baseCeilingCoreLightIntensity * ceilingFlickerFactor * (1 - finalQuestionDimLevel * 0.54);
 
       ambient.color.copy(baseAmbientColor).lerp(alertAmbientColor, finalQuestionDimLevel);
       dimRim.color.copy(baseDimRimColor).lerp(alertDimRimColor, finalQuestionDimLevel);
       flashLight.color.copy(baseFlashColor).lerp(alertFlashColor, finalQuestionDimLevel);
       flashFill.color.copy(baseFlashFillColor).lerp(alertFlashFillColor, finalQuestionDimLevel);
       ceilingGlowMaterial.emissive.copy(baseCeilingEmissiveColor).lerp(alertCeilingEmissiveColor, finalQuestionDimLevel);
+      ceilingCoreLight.color.copy(baseCeilingCoreLightColor).lerp(alertCeilingCoreLightColor, finalQuestionDimLevel);
 
       if (isEndingWorldStage) {
         endingExplosionFlash.visible = false;
@@ -3687,6 +4535,10 @@ export default function App() {
 
       const speedRatio = THREE.MathUtils.clamp(currentVelocity.length() / walkSpeed, 0, 1);
       const isMoving = speedRatio > 0.05;
+
+      if (isMoving) {
+        lastPlayerMoveAt = performance.now();
+      }
 
       if (alienRoot) {
         const alienDx = playerPosition.x - alienCollisionCenter.x;
@@ -3764,6 +4616,40 @@ export default function App() {
         ceilingGlowMaterial.emissive.copy(alertCeilingEmissiveColor).lerp(baseCeilingEmissiveColor, redWhiteMix);
       }
 
+      if (!isEndingWorldStage && isHeadNoReactionActive) {
+        const noShakeCameraJitter = 0.002 * headReactionEnvelope;
+        shakePosX += Math.sin(elapsed * 60.0) * noShakeCameraJitter * 0.72;
+        shakePosY += Math.sin(elapsed * 74.0 + 0.9) * noShakeCameraJitter * 0.44;
+        shakePosZ += Math.sin(elapsed * 66.0 + 1.4) * noShakeCameraJitter * 0.52;
+        shakeYaw +=
+          headJoltDirectionRef.current * Math.sin(headReactionProgress * Math.PI * 4.2) * 0.011 * headReactionEnvelope;
+        shakePitch += Math.sin(elapsed * 68.0 + 0.4) * 0.0048 * headReactionEnvelope;
+
+        const noFlashPulse = Math.sin(elapsed * 24.0) * 0.5 + 0.5;
+        const noFlashMix = (0.18 + noFlashPulse * 0.2) * headReactionEnvelope;
+        const noCeilingFlashMix = Math.min(1, noFlashMix * 2.6);
+        ambient.color.lerp(alertAmbientColor, noFlashMix);
+        dimRim.color.lerp(alertDimRimColor, noFlashMix);
+        flashLight.color.lerp(alertFlashColor, noFlashMix);
+        flashFill.color.lerp(alertFlashFillColor, noFlashMix);
+        ceilingGlowMaterial.emissive.lerp(alertCeilingEmissiveColor, noCeilingFlashMix);
+        ceilingCoreLight.color.lerp(alertCeilingCoreLightColor, noFlashMix);
+        ceilingCoreLight.intensity += baseCeilingCoreLightIntensity * noFlashMix * 0.28;
+      }
+
+      if (!isEndingWorldStage && isHeadYesReactionActive) {
+        const yesFlashEnvelope = Math.pow(headReactionEnvelope, 0.78);
+        const yesFlashMix = 0.56 * yesFlashEnvelope;
+        const yesCeilingFlashMix = Math.min(1, yesFlashMix * 1.8);
+        ambient.color.lerp(affirmAmbientColor, yesFlashMix);
+        dimRim.color.lerp(affirmDimRimColor, yesFlashMix);
+        flashLight.color.lerp(affirmFlashColor, yesFlashMix);
+        flashFill.color.lerp(affirmFlashFillColor, yesFlashMix);
+        ceilingGlowMaterial.emissive.lerp(affirmFlashColor, yesCeilingFlashMix);
+        ceilingCoreLight.color.lerp(affirmFlashColor, yesFlashMix);
+        ceilingCoreLight.intensity += baseCeilingCoreLightIntensity * yesFlashMix * 0.24;
+      }
+
       const stunNow = performance.now();
       if (stunNow < stunEndsAtRef.current) {
         const stunDurationMs = Math.max(1, stunEndsAtRef.current - stunStartedAtRef.current);
@@ -3824,12 +4710,46 @@ export default function App() {
           uniform.value = elapsed;
         }
 
-        const joltNow = performance.now();
-        const reactionDurationMs = Math.max(1, headJoltEndsAtRef.current - headReactionStartedAtRef.current);
-        const reactionProgress = THREE.MathUtils.clamp((joltNow - headReactionStartedAtRef.current) / reactionDurationMs, 0, 1);
-        const reactionEnvelope = joltNow < headJoltEndsAtRef.current ? Math.sin(reactionProgress * Math.PI) : 0;
-        const isHeadReactionActive =
-          reactionEnvelope > 0 && (headReactionModeRef.current === "no" || headReactionModeRef.current === "yes");
+        const desiredBodyYaw = Math.atan2(
+          playerPosition.x - alienRoot.position.x,
+          playerPosition.z - alienRoot.position.z,
+        );
+        const bodyYawError = shortestAngleDelta(alienBodyYaw, desiredBodyYaw);
+        const playerPausedMs = performance.now() - lastPlayerMoveAt;
+        const shouldIdleRecenter =
+          playerPausedMs >= alienBodyRecenterPauseMs && Math.abs(bodyYawError) > alienBodyRecenterThreshold;
+        const shouldBodyFollow = Math.abs(bodyYawError) > maxAlienHeadTrackYaw || shouldIdleRecenter;
+
+        if (shouldBodyFollow) {
+          let turnSpeed = shouldIdleRecenter ? alienBodyIdleRecenterSpeed : alienBodyFollowTurnSpeed;
+
+          if (shouldIdleRecenter) {
+            const rampUpRaw = THREE.MathUtils.clamp((playerPausedMs - alienBodyRecenterPauseMs) / 700, 0, 1);
+            const rampUp = rampUpRaw * rampUpRaw * (3 - 2 * rampUpRaw);
+
+            const errorMagnitude = Math.abs(bodyYawError);
+            const rampDownRaw = THREE.MathUtils.clamp(errorMagnitude / THREE.MathUtils.degToRad(34), 0, 1);
+            const rampDown = rampDownRaw * rampDownRaw * (3 - 2 * rampDownRaw);
+
+            const easedTurnFactor = Math.max(0.18, rampUp * rampDown);
+            turnSpeed = THREE.MathUtils.lerp(0.35, alienBodyIdleRecenterSpeed, easedTurnFactor);
+          }
+
+          const maxStep = turnSpeed * delta;
+          alienBodyYaw = normalizeAngleRadians(alienBodyYaw + clamp(bodyYawError, -maxStep, maxStep));
+          alienRoot.rotation.y = alienBodyYaw;
+        }
+
+        const headTrackYaw = -clamp(
+          shortestAngleDelta(alienBodyYaw, desiredBodyYaw),
+          -maxAlienHeadTrackYaw,
+          maxAlienHeadTrackYaw,
+        );
+        for (const uniform of alienHeadTrackYawUniforms) {
+          uniform.value = headTrackYaw;
+        }
+
+        const isHeadReactionActive = isHeadNoReactionActive || isHeadYesReactionActive;
 
         for (const uniform of alienArmTalkUniforms) {
           uniform.value = armTalkLevel;
@@ -3840,12 +4760,12 @@ export default function App() {
         }
 
         const headNoAngle =
-          headReactionModeRef.current === "no"
-            ? headJoltDirectionRef.current * Math.sin(reactionProgress * Math.PI * 4.2) * 0.34 * reactionEnvelope
+          isHeadNoReactionActive
+            ? headJoltDirectionRef.current * Math.sin(headReactionProgress * Math.PI * 4.2) * 0.34 * headReactionEnvelope
             : 0;
         const headYesAngle =
-          headReactionModeRef.current === "yes"
-            ? Math.sin(reactionProgress * Math.PI * 2.4) * 0.45 * reactionEnvelope
+          isHeadYesReactionActive
+            ? Math.pow(Math.sin(headReactionProgress * Math.PI * 2.0), 2) * 0.5 * headReactionEnvelope
             : 0;
 
         for (const uniform of alienHeadNoUniforms) {
@@ -3855,8 +4775,6 @@ export default function App() {
         for (const uniform of alienHeadYesUniforms) {
           uniform.value = headYesAngle;
         }
-
-        alienRoot.lookAt(camera.position.x, alienRoot.position.y, camera.position.z);
       }
 
       for (const symbol of floatingWallSymbols) {
@@ -3916,11 +4834,14 @@ export default function App() {
     };
   }, [
     fadeBuildupTo,
+    fadeFallingShipTo,
     isDevBuild,
     playDistantExplosionOneShot,
     playEndingRumbleOneShot,
     playFlickerZapOneShot,
     playFootstepOneShot,
+    playShakingShipCue,
+    stopShipHum,
     speechSupported,
   ]);
 
@@ -4019,6 +4940,14 @@ export default function App() {
     stopQuestionSpeech();
     clearPreparedSpeechCache();
     void stopShipHum();
+    if (endingEchoTimeoutRef.current !== null) {
+      window.clearTimeout(endingEchoTimeoutRef.current);
+      endingEchoTimeoutRef.current = null;
+    }
+    endingEchoPlayedRef.current = false;
+    if (speechSupported) {
+      window.speechSynthesis.cancel();
+    }
     setScore(0);
     setTurnIndex(0);
     setHistory([]);
@@ -4046,7 +4975,7 @@ export default function App() {
   const saved = score >= EARTH_SAVED_THRESHOLD;
   const verdictLine = saved
     ? "The alien lowers its gaze and the ship begins to fade, its final words echoing softly—\"Earth may continue\""
-    : "The alien’s many voices merge into one cold verdict—‘Earth has failed the protocol’—and in the silence that follows, a bright explosion swallows the sky.";
+    : "The alien’s many voices merge into one cold verdict—‘Earth has failed the protocol’—as a bright explosion swallows the sky.";
   const revealBlackoutOpacity = phase === "intro" ? 0 : isRevealing ? Math.max(0, 1 - revealProgress) : 0;
   const sceneBlackoutOpacity = Math.max(revealBlackoutOpacity, endingBlackoutOpacity);
 
@@ -4062,30 +4991,81 @@ export default function App() {
       <div className="scene-vignette" aria-hidden="true" />
 
       <aside className="game-hud">
-        <div className="volume-row">
-          <label className="volume-label" htmlFor="master-volume">
-            Volume
-          </label>
-          <input
-            id="master-volume"
-            className="volume-slider"
-            type="range"
-            min={0}
-            max={100}
-            value={masterVolume}
-            onChange={(event) => {
-              setMasterVolume(Number(event.target.value));
-            }}
-          />
-          <span className="volume-value">{masterVolume}%</span>
-        </div>
-
-        {phase !== "intro" && (
-          <div className="status-row">
-          <span className="desktop-only-hint">WASD to walk</span>
-          <span>Drag screen to look</span>
+        <div className="control-dock">
+          <div className={`control-group ${isHelpOpen ? "is-open" : ""}`}>
+            <button
+              className="control-icon-btn"
+              type="button"
+              onClick={() => setIsHelpOpen((open) => !open)}
+              aria-label="Toggle controls help"
+              aria-expanded={isHelpOpen}
+            >
+              <svg className="control-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M8.9 9.1A3.3 3.3 0 0 1 12 6.8c1.9 0 3.3 1.2 3.3 2.9 0 1.5-0.8 2.3-2.1 3.1-1.1 0.6-1.7 1.1-1.7 2.2v0.5"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.9"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                />
+                <circle cx="12" cy="18.1" r="1" fill="currentColor" />
+              </svg>
+            </button>
+            <div className="control-panel help-panel" aria-hidden={!isHelpOpen}>
+              <span className="desktop-only-hint">WASD to walk</span>
+              <span>Drag screen to look</span>
+            </div>
           </div>
-        )}
+
+          <div className={`control-group ${isVolumeOpen ? "is-open" : ""}`}>
+            <button
+              className="control-icon-btn"
+              type="button"
+              onClick={() => setIsVolumeOpen((open) => !open)}
+              aria-label="Toggle volume control"
+              aria-expanded={isVolumeOpen}
+            >
+              <svg className="control-icon-svg" viewBox="0 0 24 24" aria-hidden="true">
+                <path
+                  d="M4 9h4l5-4v14l-5-4H4z"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinejoin="round"
+                />
+                <path
+                  d="M16 9.5c1.4 1.2 1.4 3.8 0 5"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                />
+                <path
+                  d="M18.8 7.2c2.5 2.3 2.5 7.3 0 9.6"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                />
+              </svg>
+            </button>
+            <div className="control-panel volume-panel" aria-hidden={!isVolumeOpen}>
+              <input
+                id="master-volume"
+                className="volume-slider"
+                type="range"
+                min={0}
+                max={100}
+                value={masterVolume}
+                onChange={(event) => {
+                  setMasterVolume(Number(event.target.value));
+                }}
+              />
+              <span className="volume-value">{masterVolume}%</span>
+            </div>
+          </div>
+        </div>
 
         {phase === "intro" && (
           <div className="qa-panel qa-intro-panel">
