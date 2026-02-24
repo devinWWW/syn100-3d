@@ -1580,9 +1580,11 @@ export default function App() {
   const endMusicAudioRef = useRef<HTMLAudioElement | null>(null);
   const endMusicGainRef = useRef(0);
   const endMusicFadeFrameRef = useRef<number | null>(null);
+  const endMusicPauseTimeoutRef = useRef<number | null>(null);
   const buildupAudioRef = useRef<HTMLAudioElement | null>(null);
   const buildupGainRef = useRef(0);
   const buildupFadeFrameRef = useRef<number | null>(null);
+  const buildupPauseTimeoutRef = useRef<number | null>(null);
   const shakingShipAudioRef = useRef<HTMLAudioElement | null>(null);
   const shakingShipGainRef = useRef(0);
   const shakingShipFadeFrameRef = useRef<number | null>(null);
@@ -1590,6 +1592,7 @@ export default function App() {
   const fallingShipAudioRef = useRef<HTMLAudioElement | null>(null);
   const fallingShipGainRef = useRef(0);
   const fallingShipFadeFrameRef = useRef<number | null>(null);
+  const fallingShipPauseTimeoutRef = useRef<number | null>(null);
   const endingBlackoutOpacityRef = useRef(0);
   const endingFlashOpacityRef = useRef(0);
   const endingPanelVisibleRef = useRef(false);
@@ -1834,6 +1837,7 @@ export default function App() {
       const activeLayers = prepared.layers.map((layer) => {
         const audio = new Audio(layer.url);
         audio.preload = "auto";
+        audio.muted = masterVolumeRef.current <= 0.0001;
         audio.volume = clamp(normalizedMasterVolume * layer.volumeScale, 0, 1);
 
         if (segment.profile.effectPreset !== "none" && fxContext) {
@@ -2473,6 +2477,13 @@ export default function App() {
     }
   }, []);
 
+  const clearTrackPauseTimeout = useCallback((timeoutRef: { current: number | null }) => {
+    if (timeoutRef.current !== null) {
+      window.clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  }, []);
+
   const fadeOceanAmbienceTo = useCallback(
     (targetGain: number, durationMs: number) => {
       const target = clamp(targetGain, 0, 1);
@@ -2766,6 +2777,7 @@ export default function App() {
 
   useEffect(() => {
     const normalized = Math.max(0, Math.min(1, masterVolume / 100));
+    const hardMuted = normalized <= 0.0001;
     masterVolumeRef.current = normalized;
 
     const context = humAudioContextRef.current;
@@ -2780,25 +2792,31 @@ export default function App() {
     mediaElements.forEach((element) => {
       const media = element as HTMLMediaElement;
       media.volume = normalized;
+      media.muted = hardMuted;
     });
 
     if (buttonClickAudioRef.current) {
+      buttonClickAudioRef.current.muted = hardMuted;
       buttonClickAudioRef.current.volume = Math.min(1, normalized * 0.9);
     }
 
     if (flickerZapAudioRef.current) {
+      flickerZapAudioRef.current.muted = hardMuted;
       flickerZapAudioRef.current.volume = clamp(normalized * FLICKER_ZAP_VOLUME_SCALE, 0, 1);
     }
 
     if (noBeepAudioRef.current) {
+      noBeepAudioRef.current.muted = hardMuted;
       noBeepAudioRef.current.volume = clamp(normalized * HEAD_SHAKE_NO_VOLUME_SCALE, 0, 1);
     }
 
     if (yesEchoAudioRef.current) {
+      yesEchoAudioRef.current.muted = hardMuted;
       yesEchoAudioRef.current.volume = clamp(normalized * HEAD_SHAKE_YES_VOLUME_SCALE, 0, 1);
     }
 
     if (revealAudioRef.current && !isRevealingRef.current) {
+      revealAudioRef.current.muted = hardMuted;
       revealAudioRef.current.volume = Math.min(1, normalized * 0.42);
     }
 
@@ -2810,13 +2828,19 @@ export default function App() {
     applyFallingShipVolume();
 
     if (distantExplosionAudioRef.current) {
+      distantExplosionAudioRef.current.muted = hardMuted;
       distantExplosionAudioRef.current.volume = clamp(normalized * DISTANT_EXPLOSION_VOLUME_SCALE, 0, 1);
     }
 
     if (speechAudioLayersRef.current.length > 0) {
       for (const layer of speechAudioLayersRef.current) {
+        layer.audio.muted = hardMuted;
         layer.audio.volume = clamp(normalized * layer.volumeScale, 0, 1);
       }
+    }
+
+    if (hardMuted && speechSupported) {
+      window.speechSynthesis.cancel();
     }
   }, [
     applyBuildupVolume,
@@ -2826,6 +2850,7 @@ export default function App() {
     applyOceanAmbienceVolume,
     applyShakingShipVolume,
     masterVolume,
+    speechSupported,
   ]);
 
   useEffect(() => {
@@ -2924,6 +2949,21 @@ export default function App() {
       if (oceanAmbiencePauseTimeoutRef.current !== null) {
         window.clearTimeout(oceanAmbiencePauseTimeoutRef.current);
         oceanAmbiencePauseTimeoutRef.current = null;
+      }
+
+      if (endMusicPauseTimeoutRef.current !== null) {
+        window.clearTimeout(endMusicPauseTimeoutRef.current);
+        endMusicPauseTimeoutRef.current = null;
+      }
+
+      if (buildupPauseTimeoutRef.current !== null) {
+        window.clearTimeout(buildupPauseTimeoutRef.current);
+        buildupPauseTimeoutRef.current = null;
+      }
+
+      if (fallingShipPauseTimeoutRef.current !== null) {
+        window.clearTimeout(fallingShipPauseTimeoutRef.current);
+        fallingShipPauseTimeoutRef.current = null;
       }
 
       clickAudio.pause();
@@ -3030,6 +3070,7 @@ export default function App() {
     }
 
     if (phase === "ending" && endingPanelVisible) {
+      clearTrackPauseTimeout(endMusicPauseTimeoutRef);
       const playAttempt = endMusic.play();
       if (playAttempt && typeof playAttempt.then === "function") {
         void playAttempt
@@ -3046,7 +3087,23 @@ export default function App() {
     }
 
     fadeEndMusicTo(0, 700);
-  }, [endingPanelVisible, fadeEndMusicTo, phase]);
+    clearTrackPauseTimeout(endMusicPauseTimeoutRef);
+    endMusicPauseTimeoutRef.current = window.setTimeout(() => {
+      endMusicPauseTimeoutRef.current = null;
+
+      if (phaseRef.current === "ending" && endingPanelVisibleRef.current) {
+        return;
+      }
+
+      const latestEndMusic = endMusicAudioRef.current;
+      if (!latestEndMusic) {
+        return;
+      }
+
+      latestEndMusic.pause();
+      latestEndMusic.currentTime = 0;
+    }, 760);
+  }, [clearTrackPauseTimeout, endingPanelVisible, fadeEndMusicTo, phase]);
 
   useEffect(() => {
     if (!speechSupported) {
@@ -3068,7 +3125,7 @@ export default function App() {
   }, [speechSupported]);
 
   useEffect(() => {
-    const shouldPlayEndingSpeech = speechSupported && phase === "ending" && endingPanelVisible;
+    const shouldPlayEndingSpeech = speechSupported && masterVolume > 0 && phase === "ending" && endingPanelVisible;
     const isSavedOutcome = endingSavedOutcomeRef.current;
 
     if (!shouldPlayEndingSpeech) {
@@ -3079,6 +3136,10 @@ export default function App() {
 
       if (phase !== "ending") {
         endingEchoPlayedRef.current = false;
+      }
+
+      if (speechSupported && masterVolume <= 0) {
+        window.speechSynthesis.cancel();
       }
       return;
     }
@@ -3142,7 +3203,7 @@ export default function App() {
         endingEchoTimeoutRef.current = null;
       }
     };
-  }, [speechSupported, phase, endingPanelVisible]);
+  }, [speechSupported, masterVolume, phase, endingPanelVisible]);
 
   const handleGlobalButtonClick = (event: React.MouseEvent<HTMLElement>) => {
     const target = event.target as HTMLElement | null;
@@ -3176,10 +3237,12 @@ export default function App() {
   useEffect(() => {
     const applyMediaVolume = () => {
       const normalized = masterVolumeRef.current;
+      const hardMuted = normalized <= 0.0001;
       const mediaElements = document.querySelectorAll("audio, video");
       mediaElements.forEach((element) => {
         const media = element as HTMLMediaElement;
         media.volume = normalized;
+        media.muted = hardMuted;
       });
     };
 
@@ -3308,7 +3371,7 @@ export default function App() {
   }, [voiceEnabled, phase, currentTurn, isRevealing, openAiApiKey, turnIndex, prepareOpenAiLayeredSpeech]);
 
   useEffect(() => {
-    if (!speechSupported || !voiceEnabled || phase !== "questions" || !currentTurn || isRevealing) {
+    if (!speechSupported || !voiceEnabled || phase !== "questions" || !currentTurn || isRevealing || masterVolume <= 0) {
       stopQuestionSpeech();
       if (phase !== "questions") {
         spokenTurnRef.current = null;
@@ -4332,6 +4395,7 @@ export default function App() {
         const buildup = buildupAudioRef.current;
         if (buildup) {
           if (shouldBuildupBeActive) {
+            clearTrackPauseTimeout(buildupPauseTimeoutRef);
             try {
               buildup.currentTime = BUILDUP_TRIM_OFFSET_SECONDS;
             } catch {
@@ -4351,6 +4415,26 @@ export default function App() {
             }
           } else {
             fadeBuildupTo(0, 650);
+            clearTrackPauseTimeout(buildupPauseTimeoutRef);
+            buildupPauseTimeoutRef.current = window.setTimeout(() => {
+              buildupPauseTimeoutRef.current = null;
+
+              const liveStage = endingCinematicRef.current.stage;
+              const shouldStillPlay =
+                phaseRef.current === "ending" &&
+                (liveStage === "room-shake-flash" || liveStage === "fade-room-black");
+              if (shouldStillPlay) {
+                return;
+              }
+
+              const latestBuildup = buildupAudioRef.current;
+              if (!latestBuildup) {
+                return;
+              }
+
+              latestBuildup.pause();
+              latestBuildup.currentTime = 0;
+            }, 720);
           }
         }
       }
@@ -4360,6 +4444,7 @@ export default function App() {
         const fallingShip = fallingShipAudioRef.current;
         if (fallingShip) {
           if (fallingShipActive) {
+            clearTrackPauseTimeout(fallingShipPauseTimeoutRef);
             try {
               fallingShip.currentTime = 0;
             } catch {
@@ -4379,6 +4464,26 @@ export default function App() {
             }
           } else {
             fadeFallingShipTo(0, 650);
+            clearTrackPauseTimeout(fallingShipPauseTimeoutRef);
+            fallingShipPauseTimeoutRef.current = window.setTimeout(() => {
+              fallingShipPauseTimeoutRef.current = null;
+
+              const liveStage = endingCinematicRef.current.stage;
+              const shouldStillPlay =
+                phaseRef.current === "ending" &&
+                (liveStage === "room-shake-flash" || liveStage === "fade-room-black");
+              if (shouldStillPlay) {
+                return;
+              }
+
+              const latestFallingShip = fallingShipAudioRef.current;
+              if (!latestFallingShip) {
+                return;
+              }
+
+              latestFallingShip.pause();
+              latestFallingShip.currentTime = 0;
+            }, 720);
           }
         }
       }
@@ -5017,6 +5122,7 @@ export default function App() {
       }
     };
   }, [
+    clearTrackPauseTimeout,
     fadeBuildupTo,
     fadeFallingShipTo,
     isDevBuild,
