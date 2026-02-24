@@ -301,6 +301,26 @@ function extractQuestionSpeechSegments(text: string): QuestionSpeechSegment[] {
 function pickCreepyVoice(voices: SpeechSynthesisVoice[]) {
   if (voices.length === 0) return null;
 
+  const navWithUAData =
+    typeof navigator !== "undefined"
+      ? (navigator as Navigator & { userAgentData?: { platform?: string } })
+      : null;
+  const platform = (navWithUAData?.userAgentData?.platform ?? navigator.platform ?? "").toLowerCase();
+
+  const findPreferredVoice = (namePattern: RegExp) =>
+    voices.find((voice) => namePattern.test(voice.name) && /^en/i.test(voice.lang));
+
+  if (platform.includes("mac")) {
+    const macPreferred = findPreferredVoice(/^alex$/i) ?? findPreferredVoice(/\balex\b/i);
+    if (macPreferred) return macPreferred;
+  }
+
+  if (platform.includes("win")) {
+    const windowsPreferred =
+      findPreferredVoice(/^microsoft david\b/i) ?? findPreferredVoice(/microsoft david/i);
+    if (windowsPreferred) return windowsPreferred;
+  }
+
   const voicePriority = [
     /zira|hazel|hedda|susan|sara|mark|david|zira/i,
     /microsoft|google|samantha|alex|victoria/i,
@@ -1534,6 +1554,7 @@ export default function App() {
   const oceanAmbienceAudioRef = useRef<HTMLAudioElement | null>(null);
   const oceanAmbienceGainRef = useRef(0);
   const oceanAmbienceFadeFrameRef = useRef<number | null>(null);
+  const oceanAmbiencePauseTimeoutRef = useRef<number | null>(null);
   const distantExplosionAudioRef = useRef<HTMLAudioElement | null>(null);
   const endMusicAudioRef = useRef<HTMLAudioElement | null>(null);
   const endMusicGainRef = useRef(0);
@@ -1570,6 +1591,7 @@ export default function App() {
   const speechDelayTimeoutRef = useRef<number | null>(null);
   const endingEchoTimeoutRef = useRef<number | null>(null);
   const endingEchoPlayedRef = useRef(false);
+  const speechGestureUnlockedRef = useRef(false);
   const speechQueueTokenRef = useRef(0);
   const speechAudioLayersRef = useRef<ActiveSpeechLayer[]>([]);
   const speechAbortControllersRef = useRef<AbortController[]>([]);
@@ -1856,14 +1878,32 @@ export default function App() {
         return audio;
       });
 
-      await Promise.all(activeLayers.map((audio) => audio.play().catch(() => void 0)));
+      const playResults = await Promise.all(
+        activeLayers.map(async (audio) => {
+          try {
+            await audio.play();
+            return true;
+          } catch {
+            return false;
+          }
+        }),
+      );
+
+      const startedLayers = activeLayers.filter((_, index) => playResults[index]);
+      if (startedLayers.length < 1) {
+        return false;
+      }
 
       if (speechQueueTokenRef.current !== queueToken) {
+        for (const audio of startedLayers) {
+          audio.pause();
+          audio.currentTime = 0;
+        }
         return false;
       }
 
       await Promise.all(
-        activeLayers.map(
+        startedLayers.map(
           (audio) =>
             new Promise<void>((resolve) => {
               const finish = () => {
@@ -2405,6 +2445,13 @@ export default function App() {
     oceanAmbience.volume = clamp(masterVolumeRef.current * OCEAN_AMBIENCE_VOLUME_SCALE * oceanAmbienceGainRef.current, 0, 1);
   }, []);
 
+  const clearOceanAmbiencePauseTimeout = useCallback(() => {
+    if (oceanAmbiencePauseTimeoutRef.current !== null) {
+      window.clearTimeout(oceanAmbiencePauseTimeoutRef.current);
+      oceanAmbiencePauseTimeoutRef.current = null;
+    }
+  }, []);
+
   const fadeOceanAmbienceTo = useCallback(
     (targetGain: number, durationMs: number) => {
       const target = clamp(targetGain, 0, 1);
@@ -2853,6 +2900,11 @@ export default function App() {
     applyFallingShipVolume();
 
     return () => {
+      if (oceanAmbiencePauseTimeoutRef.current !== null) {
+        window.clearTimeout(oceanAmbiencePauseTimeoutRef.current);
+        oceanAmbiencePauseTimeoutRef.current = null;
+      }
+
       clickAudio.pause();
       buttonClickAudioRef.current = null;
 
@@ -3085,6 +3137,19 @@ export default function App() {
     void clickAudio.play().catch(() => {
       return;
     });
+
+    if (speechSupported && !speechGestureUnlockedRef.current) {
+      try {
+        const primer = new SpeechSynthesisUtterance(" ");
+        primer.volume = 0;
+        window.speechSynthesis.speak(primer);
+        window.speechSynthesis.cancel();
+      } catch {
+        return;
+      } finally {
+        speechGestureUnlockedRef.current = true;
+      }
+    }
   };
 
   useEffect(() => {
@@ -3169,6 +3234,7 @@ export default function App() {
       phase === "questions" && turnIndex === OCEAN_SOUNDS_TURN_INDEX && !isRevealing;
 
     if (isOceanQuestionActive) {
+      clearOceanAmbiencePauseTimeout();
       const playAttempt = oceanAmbience.play();
       if (playAttempt && typeof playAttempt.then === "function") {
         void playAttempt
@@ -3185,7 +3251,23 @@ export default function App() {
     }
 
     fadeOceanAmbienceTo(0, 600);
-  }, [fadeOceanAmbienceTo, isRevealing, phase, turnIndex]);
+
+    clearOceanAmbiencePauseTimeout();
+    oceanAmbiencePauseTimeoutRef.current = window.setTimeout(() => {
+      oceanAmbiencePauseTimeoutRef.current = null;
+      if (phaseRef.current === "questions" && turnIndexRef.current === OCEAN_SOUNDS_TURN_INDEX && !isRevealingRef.current) {
+        return;
+      }
+
+      const latestOcean = oceanAmbienceAudioRef.current;
+      if (!latestOcean) {
+        return;
+      }
+
+      latestOcean.pause();
+      latestOcean.currentTime = 0;
+    }, 700);
+  }, [clearOceanAmbiencePauseTimeout, fadeOceanAmbienceTo, isRevealing, phase, turnIndex]);
 
   useEffect(() => {
     if (!voiceEnabled || phase !== "questions" || !currentTurn || isRevealing || !openAiApiKey) {
@@ -3243,15 +3325,34 @@ export default function App() {
             return;
           }
 
+          let finished = false;
+          const finish = () => {
+            if (finished) {
+              return;
+            }
+            finished = true;
+            window.clearTimeout(fallbackTimeout);
+            resolve();
+          };
+
           const utterance = new SpeechSynthesisUtterance(segmentText);
           utterance.voice = speechVoiceRef.current;
           utterance.lang = speechVoiceRef.current?.lang ?? "en-US";
           utterance.rate = clamp(variant.rate, 0.55, 1.08);
           utterance.pitch = clamp(variant.pitch, 0, 1.2);
           utterance.volume = clamp(normalizedMasterVolume * variant.volumeScale, 0, 1);
-          utterance.onend = () => resolve();
-          utterance.onerror = () => resolve();
-          window.speechSynthesis.speak(utterance);
+          utterance.onend = finish;
+          utterance.onerror = finish;
+
+          const fallbackTimeout = window.setTimeout(() => {
+            finish();
+          }, Math.max(2600, segmentText.length * 120));
+
+          try {
+            window.speechSynthesis.speak(utterance);
+          } catch {
+            finish();
+          }
         });
 
       const runSpeechQueue = async () => {
@@ -4007,6 +4108,52 @@ export default function App() {
       pitch = Math.max(-Math.PI / 2.25, Math.min(Math.PI / 2.25, pitch));
     };
 
+    let touchX = 0;
+    let touchY = 0;
+    let touchActive = false;
+
+    const applyLookDelta = (dx: number, dy: number) => {
+      yaw -= dx * 0.003;
+      pitch -= dy * 0.0022;
+      pitch = Math.max(-Math.PI / 2.25, Math.min(Math.PI / 2.25, pitch));
+    };
+
+    const onTouchStart = (event: TouchEvent) => {
+      if (phaseRef.current === "intro") return;
+      const touch = event.touches[0];
+      if (!touch) {
+        return;
+      }
+
+      touchActive = true;
+      isDragging = true;
+      touchX = touch.clientX;
+      touchY = touch.clientY;
+      mountEl.classList.add("is-dragging");
+    };
+
+    const onTouchMove = (event: TouchEvent) => {
+      if (phaseRef.current === "intro") return;
+      if (!touchActive || !isDragging) return;
+      const touch = event.touches[0];
+      if (!touch) {
+        return;
+      }
+
+      const dx = touch.clientX - touchX;
+      const dy = touch.clientY - touchY;
+      touchX = touch.clientX;
+      touchY = touch.clientY;
+      applyLookDelta(dx, dy);
+      event.preventDefault();
+    };
+
+    const onTouchEnd = () => {
+      touchActive = false;
+      isDragging = false;
+      mountEl.classList.remove("is-dragging");
+    };
+
     const onResize = () => {
       const { clientWidth, clientHeight } = mountEl;
       camera.aspect = clientWidth / clientHeight;
@@ -4020,6 +4167,10 @@ export default function App() {
     mountEl.addEventListener("mousedown", onMouseDown);
     window.addEventListener("mouseup", onMouseUp);
     window.addEventListener("mousemove", onMouseMove);
+    mountEl.addEventListener("touchstart", onTouchStart, { passive: true });
+    mountEl.addEventListener("touchmove", onTouchMove, { passive: false });
+    window.addEventListener("touchend", onTouchEnd, { passive: true });
+    window.addEventListener("touchcancel", onTouchEnd, { passive: true });
 
     const clock = new THREE.Clock();
     const introCameraPosition = new THREE.Vector3(0, 1.74, 4.72);
@@ -4817,6 +4968,10 @@ export default function App() {
       mountEl.removeEventListener("mousedown", onMouseDown);
       window.removeEventListener("mouseup", onMouseUp);
       window.removeEventListener("mousemove", onMouseMove);
+      mountEl.removeEventListener("touchstart", onTouchStart);
+      mountEl.removeEventListener("touchmove", onTouchMove);
+      window.removeEventListener("touchend", onTouchEnd);
+      window.removeEventListener("touchcancel", onTouchEnd);
       mountEl.classList.remove("is-dragging");
 
       scene.traverse((object) => {
