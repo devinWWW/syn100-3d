@@ -68,6 +68,7 @@ type FloatingWallSymbol = {
   baseY: number;
   angle: number;
   radial: number;
+  radialDriftAmplitude: number;
   driftSpeed: number;
   phase: number;
   twinkleSpeed: number;
@@ -1159,7 +1160,8 @@ function createFloatingWallSymbols(): {
 
   const glyphs = ["✦", "✧", "◌", "⌬", "⟁", "⟡", "⟢", "◇", "⊹", "⋆"];
   const symbolCount = 84;
-  const wallRadius = 6.02;
+  const wallSymbolRadiusMin = 6.18;
+  const wallSymbolRadiusMax = 6.31;
 
   for (let i = 0; i < symbolCount; i++) {
     const glyph = glyphs[i % glyphs.length];
@@ -1187,16 +1189,19 @@ function createFloatingWallSymbols(): {
       map: texture,
       color: "#ffffff",
       transparent: true,
-      opacity: 0.2 + Math.random() * 0.25,
+      opacity: 0.46 + Math.random() * 0.24,
+      depthTest: true,
       depthWrite: false,
-      blending: THREE.AdditiveBlending,
+      blending: THREE.NormalBlending,
     });
 
     const sprite = new THREE.Sprite(material);
+    sprite.renderOrder = 8;
     const angle = (i / symbolCount) * Math.PI * 2 + (Math.random() - 0.5) * 0.24;
-    const radial = wallRadius + (Math.random() - 0.5) * 0.07;
+    const radial = wallSymbolRadiusMin + Math.random() * (wallSymbolRadiusMax - wallSymbolRadiusMin);
     const baseY = 0.62 + Math.random() * 3.48;
     const scale = 0.28 + Math.random() * 0.3;
+    const radialDriftAmplitude = 0.01 + Math.random() * 0.035;
 
     sprite.scale.set(scale, scale, 1);
     sprite.position.set(Math.cos(angle) * radial, baseY, Math.sin(angle) * radial);
@@ -1207,6 +1212,7 @@ function createFloatingWallSymbols(): {
       baseY,
       angle,
       radial,
+      radialDriftAmplitude,
       driftSpeed: 0.22 + Math.random() * 0.38,
       phase: Math.random() * Math.PI * 2,
       twinkleSpeed: 0.65 + Math.random() * 1.25,
@@ -4780,6 +4786,8 @@ export default function App() {
       for (const symbol of floatingWallSymbols) {
         const floatPhase = elapsed * symbol.driftSpeed + symbol.phase;
         const angleDrift = Math.sin(floatPhase * 0.65) * 0.04;
+        const radialDrift = Math.sin(floatPhase * 0.52 + symbol.phase * 0.6) * symbol.radialDriftAmplitude;
+        const animatedRadial = symbol.radial + radialDrift;
         const pulse = 0.2 + (Math.sin(elapsed * symbol.twinkleSpeed + symbol.phase) * 0.5 + 0.5) * 0.42;
         const shakeX =
           Math.sin(elapsed * (25 + symbol.twinkleSpeed * 2.8) + symbol.phase * 1.3) * wallSymbolFadeInShakeAmount;
@@ -4787,8 +4795,8 @@ export default function App() {
           Math.cos(elapsed * (31 + symbol.driftSpeed * 3.2) + symbol.phase * 1.9) * wallSymbolFadeInShakeAmount * 0.52;
         const shakeZ =
           Math.sin(elapsed * (28 + symbol.twinkleSpeed * 2.1) + symbol.phase * 1.7) * wallSymbolFadeInShakeAmount;
-        symbol.sprite.position.x = Math.cos(symbol.angle + angleDrift) * symbol.radial + shakeX;
-        symbol.sprite.position.z = Math.sin(symbol.angle + angleDrift) * symbol.radial + shakeZ;
+        symbol.sprite.position.x = Math.cos(symbol.angle + angleDrift) * animatedRadial + shakeX;
+        symbol.sprite.position.z = Math.sin(symbol.angle + angleDrift) * animatedRadial + shakeZ;
         symbol.sprite.position.y = symbol.baseY + Math.sin(floatPhase) * 0.14 + shakeY;
 
         const symbolMaterial = symbol.sprite.material as THREE.SpriteMaterial;
