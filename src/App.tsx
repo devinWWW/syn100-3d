@@ -3943,22 +3943,22 @@ export default function App() {
 
     loadIntroEarthModel(0);
 
-    const introAmbient = new THREE.AmbientLight("#a5aebe", 0.11);
+    const introAmbient = new THREE.AmbientLight("#a5aebe", 0.16);
     scene.add(introAmbient);
 
-    const introRim = new THREE.DirectionalLight("#c7ced9", 0.4);
+    const introRim = new THREE.DirectionalLight("#c7ced9", 0.52);
     introRim.position.set(3.1, 2.5, 2.1);
     scene.add(introRim);
 
-    const introBack = new THREE.PointLight("#828a97", 0.13, 13.5, 2);
+    const introBack = new THREE.PointLight("#828a97", 0.2, 13.5, 2);
     introBack.position.set(-2.6, 1.1, -6.8);
     scene.add(introBack);
 
-    const introFill = new THREE.DirectionalLight("#afb7c4", 0.14);
+    const introFill = new THREE.DirectionalLight("#afb7c4", 0.22);
     introFill.position.set(-2.8, 1.8, 1.9);
     scene.add(introFill);
 
-    const ufoGlow = new THREE.PointLight("#cfd6e4", 0.52, 4.8, 2);
+    const ufoGlow = new THREE.PointLight("#cfd6e4", 0.68, 5.2, 2);
     scene.add(ufoGlow);
 
     const endingExplosionFlash = new THREE.Mesh(
