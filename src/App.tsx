@@ -5361,7 +5361,7 @@ export default function App() {
           <div className="qa-panel qa-intro-panel">
             <div className="qa-title">Protocol 0</div>
             <p className="qa-text">
-              Greetings. This is a game you have been selected to play that will determine the fate of your life. There
+              Greetings. You have been selected to play this game. It will determine your fate and the Earth's fate. There
               will be a sequence of questions you must answer to safely return back to Earth. If you choose to disobey,
               your life will no longer exist.
             </p>
