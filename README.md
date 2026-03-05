@@ -12,3 +12,30 @@ At the end, the game reveals whether Earth is spared or destroyed, then generate
 - TypeScript
 - Vite
 - Tailwind CSS
+
+## Backend (Vercel Python serverless)
+
+OpenAI requests are proxied through server-side Python handlers in `api/`, so your key is never exposed in the browser.
+
+### Vercel environment variable
+
+In your Vercel project settings, add:
+
+- `OPENAI_API_KEY` = your OpenAI API key
+
+Set it for at least `Production` (and `Preview` if needed), then redeploy.
+
+### Deploy
+
+- Connect the repo to Vercel.
+- Keep frontend calls as `/api/openai/chat-completions` and `/api/openai/audio-speech`.
+- Vercel rewrites these to Python handlers via `vercel.json`.
+
+### Local dev (optional)
+
+You can still run local dev with Vite:
+
+```bash
+npm install
+npm run dev
+```

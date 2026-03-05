@@ -395,12 +395,7 @@ function fallbackOutcomeExplanation(saved: boolean, score: number, history: Answ
 }
 
 async function generateOutcomeExplanation(saved: boolean, score: number, history: AnswerRecord[]) {
-  const apiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined;
   const model = (import.meta.env.VITE_OPENAI_MODEL as string | undefined) ?? "gpt-4o-mini";
-
-  if (!apiKey) {
-    return fallbackOutcomeExplanation(saved, score, history);
-  }
 
   const detailedQuestions = QUESTION_CONTENT.map((question, index) => {
     const questionNumber = index + 1;
@@ -450,11 +445,10 @@ Output format rules (mandatory):
 - Overall must be 2-4 sentences summarizing why Earth was spared or destroyed.`;
 
   async function requestCompletion(requestPrompt: string, temperature: number) {
-    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+    const response = await fetch("/api/openai/chat-completions", {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
         model,
@@ -1630,7 +1624,6 @@ export default function App() {
   const headJoltDirectionRef = useRef(1);
   const headReactionModeRef = useRef<"none" | "no" | "yes">("none");
 
-  const openAiApiKey = import.meta.env.VITE_OPENAI_API_KEY as string | undefined;
   const openAiTtsModel = (import.meta.env.VITE_OPENAI_TTS_MODEL as string | undefined) ?? "gpt-4o-mini-tts";
 
   const speechSupported = typeof window !== "undefined" && typeof window.speechSynthesis !== "undefined";
@@ -1724,7 +1717,7 @@ export default function App() {
 
   const prepareOpenAiLayeredSpeech = useCallback(
     async (segment: QuestionSpeechSegment, cacheKey: string) => {
-      if (!openAiApiKey || !supportsOpenAiGeneration(segment)) {
+      if (!supportsOpenAiGeneration(segment)) {
         return null;
       }
 
@@ -1747,11 +1740,10 @@ export default function App() {
 
           const layers = await Promise.all(
             layeredVariants.map(async (variant) => {
-              const response = await fetch("https://api.openai.com/v1/audio/speech", {
+              const response = await fetch("/api/openai/audio-speech", {
                 method: "POST",
                 headers: {
                   "Content-Type": "application/json",
-                  Authorization: `Bearer ${openAiApiKey}`,
                 },
                 body: JSON.stringify({
                   model: openAiTtsModel,
@@ -1802,12 +1794,12 @@ export default function App() {
       preparedSpeechPromisesRef.current.set(cacheKey, promise);
       return promise;
     },
-    [openAiApiKey, openAiTtsModel],
+    [openAiTtsModel],
   );
 
   const playOpenAiLayeredSpeech = useCallback(
     async (segment: QuestionSpeechSegment, cacheKey: string, normalizedMasterVolume: number, queueToken: number) => {
-      if (!openAiApiKey || !supportsOpenAiGeneration(segment)) {
+      if (!supportsOpenAiGeneration(segment)) {
         return false;
       }
 
@@ -1945,7 +1937,7 @@ export default function App() {
 
       return true;
     },
-    [openAiApiKey, prepareOpenAiLayeredSpeech],
+    [prepareOpenAiLayeredSpeech],
   );
 
   const playTurbulenceOneShot = useCallback(() => {
@@ -3354,7 +3346,7 @@ export default function App() {
   }, [clearOceanAmbiencePauseTimeout, fadeOceanAmbienceTo, isRevealing, phase, turnIndex]);
 
   useEffect(() => {
-    if (!voiceEnabled || phase !== "questions" || !currentTurn || isRevealing || !openAiApiKey) {
+    if (!voiceEnabled || phase !== "questions" || !currentTurn || isRevealing) {
       return;
     }
 
@@ -3368,7 +3360,7 @@ export default function App() {
       const cacheKey = getSpeechSegmentCacheKey(turnIndex, segmentIndex, segment);
       void prepareOpenAiLayeredSpeech(segment, cacheKey);
     }
-  }, [voiceEnabled, phase, currentTurn, isRevealing, openAiApiKey, turnIndex, prepareOpenAiLayeredSpeech]);
+  }, [voiceEnabled, phase, currentTurn, isRevealing, turnIndex, prepareOpenAiLayeredSpeech]);
 
   useEffect(() => {
     if (!speechSupported || !voiceEnabled || phase !== "questions" || !currentTurn || isRevealing || masterVolume <= 0) {

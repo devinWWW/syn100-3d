@@ -1,0 +1,12 @@
+{
+  "rewrites": [
+    {
+      "source": "/api/openai/chat-completions",
+      "destination": "/api/openai/chat_completions"
+    },
+    {
+      "source": "/api/openai/audio-speech",
+      "destination": "/api/openai/audio_speech"
+    }
+  ]
+}
